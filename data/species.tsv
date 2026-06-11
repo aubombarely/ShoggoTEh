@@ -1,0 +1,5 @@
+# Format: species_id<TAB>fasta<TAB>bed<TAB>gff3
+# gff3 column is optional — use NA if not available
+# Example:
+# Arabidopsis_thaliana	/path/to/genome.fa	/path/to/filteredRepeats.bed	/path/to/annotation.gff3
+# Oryza_sativa	/path/to/genome.fa	/path/to/filteredRepeats.bed	NA

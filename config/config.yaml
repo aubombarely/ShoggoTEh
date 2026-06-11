@@ -1,0 +1,27 @@
+# ── Input ──────────────────────────────────────────────────────────────────────
+species_tsv: "data/species.tsv"
+
+# ── Sequence chunking ──────────────────────────────────────────────────────────
+chunk_size: 5000       # window size in bp
+overlap: 0.5           # fractional overlap between consecutive windows (0.5 = 50%)
+
+# ── Labeling ───────────────────────────────────────────────────────────────────
+min_fraction: 0.5      # min fraction of window covered by a class to assign that label
+max_n_fraction: 0.1    # max fraction of N bases allowed in a chunk
+
+# ── Hyena-DNA model ────────────────────────────────────────────────────────────
+hyena_model: "LongSafari/hyenadna-medium-160k-seqlen-hf"
+embedding_batch_size: 32
+
+# ── Classifier ─────────────────────────────────────────────────────────────────
+labels:
+  - LTR
+  - DNA
+  - LINE
+  - SINE
+  - Unknown_repeat
+  - Genic
+  - Intergenic
+
+# ── Resources ──────────────────────────────────────────────────────────────────
+threads: 8

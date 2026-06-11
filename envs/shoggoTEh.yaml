@@ -1,0 +1,19 @@
+name: shoggoTEh
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python>=3.10
+  - pandas
+  - numpy
+  - pyarrow
+  - pyfaidx
+  - pybedtools
+  - pip
+  - pip:
+      - torch>=2.0
+      - transformers>=4.36
+      - accelerate
+      - einops
+      - codecarbon
