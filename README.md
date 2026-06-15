@@ -32,6 +32,15 @@ train_classifier.py         Train a one-hidden-layer MLP on the
 predict.py                  Slide windows across a new genome,
                             embed, classify, and write results.
                             Output: {prefix}.bed, {prefix}_probs.tsv
+
+
+compare_te_annotation.py    Compare predictions against a reference
+  -t target.bed               annotation (e.g. EarlGrey). Assigns a
+  -r reference.bed            reference label per window by majority
+  [--gff3 genes.gff3]         bp overlap and computes per-class and
+                              overall metrics.
+                              Output: {prefix}_comparison.tsv,
+                                      {prefix}_metrics.tsv
 ```
 
 ## Labels
@@ -155,6 +164,40 @@ Output files in `--outdir`:
 |------|-------------|
 | `{prefix}.bed` | Top predicted class and confidence per window (`chrom start end label score .`) |
 | `{prefix}_probs.tsv` | Full softmax probability for every class per window |
+
+### 6. Compare against a reference annotation
+
+```bash
+# Repeat classes only
+python scripts/compare_te_annotation.py \
+    -t predictions/genome.bed \
+    -r filteredRepeats.bed \
+    --outdir comparisons/
+
+# With gene models for Genic/Intergenic resolution
+python scripts/compare_te_annotation.py \
+    -t predictions/genome.bed \
+    -r filteredRepeats.bed \
+    --gff3 annotation.gff3 \
+    --outdir comparisons/
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-t / --target` | required | ShoggoTEh BED output (`predict.py`) |
+| `-r / --reference` | required | Reference BED (e.g. EarlGrey `filteredRepeats.bed`) |
+| `--gff3` | None | Gene annotation GFF3 — resolves `Genic` vs `Intergenic` for non-repeat windows |
+| `--prefix` | target BED stem | Output filename prefix |
+| `--min_fraction` | `0.5` | Min overlap fraction to assign a reference label |
+
+Reference labels are normalised to the ShoggoTEh label set using the same `REPEAT_CLASS_MAP` as `prepare_dataset.py` (`LTR/Gypsy` → `LTR`, `DNA/hAT` → `DNA`, etc.). Windows where no single repeat class reaches `--min_fraction` are marked `Ambiguous`, reported in the comparison file, and excluded from the metrics.
+
+Output files in `--outdir`:
+
+| File | Description |
+|------|-------------|
+| `{prefix}_comparison.tsv` | Per-window detail: target label, reference label, overlap bp and fraction, match (True/False) |
+| `{prefix}_metrics.tsv` | Per-class precision, recall, F1 and support; macro and weighted averages; overall accuracy; confusion matrix |
 
 ## Carbon footprint tracking
 
