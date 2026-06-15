@@ -156,6 +156,51 @@ def label_windows(windows: list, repeats_df: pd.DataFrame,
     return window_labels
 
 
+# ── Chromosome name consistency check ─────────────────────────────────────────
+def _check_chroms(species_id: str, fasta: Fasta,
+                  repeats_df: pd.DataFrame, genes_df: pd.DataFrame | None) -> None:
+    """Raise ValueError if BED or GFF3 chromosome names don't overlap with FASTA."""
+    fasta_chroms = set(fasta.keys())
+
+    bed_chroms = set(repeats_df["chrom"].unique())
+    shared_bed = fasta_chroms & bed_chroms
+    if not shared_bed:
+        only_fasta = sorted(fasta_chroms)[:5]
+        only_bed   = sorted(bed_chroms)[:5]
+        raise ValueError(
+            f"No chromosome names in common between FASTA and BED.\n"
+            f"  FASTA examples : {only_fasta}\n"
+            f"  BED examples   : {only_bed}\n"
+            f"Check that both files use the same naming convention (e.g. 'Chr1' vs '1')."
+        )
+    unmatched_bed = bed_chroms - fasta_chroms
+    if unmatched_bed:
+        log.warning(
+            f"{species_id}: {len(unmatched_bed)} BED chromosome(s) not found in FASTA "
+            f"(e.g. {sorted(unmatched_bed)[:3]}) — those intervals will be ignored."
+        )
+
+    if genes_df is not None:
+        gff_chroms = set(genes_df["chrom"].unique())
+        shared_gff = fasta_chroms & gff_chroms
+        if not shared_gff:
+            only_fasta = sorted(fasta_chroms)[:5]
+            only_gff   = sorted(gff_chroms)[:5]
+            raise ValueError(
+                f"No chromosome names in common between FASTA and GFF3.\n"
+                f"  FASTA examples : {only_fasta}\n"
+                f"  GFF3 examples  : {only_gff}\n"
+                f"Check that both files use the same naming convention "
+                f"(e.g. 'Chr1' vs 'ArthaTAIR10C1')."
+            )
+        unmatched_gff = gff_chroms - fasta_chroms
+        if unmatched_gff:
+            log.warning(
+                f"{species_id}: {len(unmatched_gff)} GFF3 chromosome(s) not found in FASTA "
+                f"(e.g. {sorted(unmatched_gff)[:3]}) — those genes will be ignored."
+            )
+
+
 # ── Main per-species processing ────────────────────────────────────────────────
 def process_species(species_id: str, fasta_path: str, bed_path: str,
                     gff3_path: str | None, chunk_size: int, stride: int,
@@ -189,6 +234,7 @@ def process_species(species_id: str, fasta_path: str, bed_path: str,
         genes_df = gff[gff["feature"] == "gene"][["chrom", "start", "end"]].copy()
         genes_df["start"] = genes_df["start"] - 1  # GFF3 is 1-based
 
+    _check_chroms(species_id, fasta, repeats_df, genes_df)
     log.info(f"{species_id}: labeling windows")
     window_labels = label_windows(windows, repeats_df, genes_df,
                                   min_fraction, chunk_size)
