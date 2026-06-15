@@ -128,7 +128,7 @@ def label_windows(windows: list, repeats_df: pd.DataFrame,
 
     # Refine Non_repeat → Genic / Intergenic if gene annotations available
     if genes_df is not None:
-        non_rep = [w for w in windows if window_labels.get(tuple(w), (None,))[0] == "Non_repeat"]
+        non_rep = [w for w in windows if (window_labels.get(tuple(w)) or (None,))[0] == "Non_repeat"]
         if non_rep:
             nr_bed = pybedtools.BedTool.from_dataframe(
                 pd.DataFrame(non_rep, columns=["chrom", "start", "end"])
