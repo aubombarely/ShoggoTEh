@@ -1,5 +1,9 @@
 # ShoggoTEh v0.1.0
 
+<p align="center">
+  <img src="assets/shoggoteh_logo.svg" width="260" alt="ShoggoTEh logo"/>
+</p>
+
 A deep learning pipeline for identifying and classifying transposable elements (TEs) in plant genomes using DNA language model embeddings.
 
 ShoggoTEh uses [Hyena-DNA](https://github.com/HazyResearch/hyena-dna) to generate sequence embeddings from genomic windows and trains a classifier to distinguish TE classes, genic, and intergenic regions — without relying on alignment-based repeat detection.

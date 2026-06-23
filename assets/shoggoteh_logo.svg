@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <defs>
+    <radialGradient id="bg" cx="40%" cy="35%" r="65%">
+      <stop offset="0%"   stop-color="#120a28"/>
+      <stop offset="100%" stop-color="#080510"/>
+    </radialGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="eyeglow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="4" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="textglow" x="-20%" y="-60%" width="140%" height="220%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <circle cx="200" cy="200" r="196" fill="#050310"/>
+  <circle cx="200" cy="200" r="185" fill="url(#bg)"/>
+  <circle cx="200" cy="200" r="192" fill="none" stroke="#2a1050" stroke-width="1.5"/>
+  <circle cx="200" cy="200" r="186" fill="none" stroke="#1a0835" stroke-width="0.6"/>
+
+  <!-- Stars -->
+  <g fill="#bb99ff" opacity="0.40">
+    <circle cx="68"  cy="82"  r="1"/>
+    <circle cx="335" cy="68"  r="1.5"/>
+    <circle cx="82"  cy="318" r="1"/>
+    <circle cx="350" cy="310" r="1.5"/>
+    <circle cx="112" cy="358" r="1"/>
+    <circle cx="294" cy="363" r="1"/>
+    <circle cx="52"  cy="208" r="1"/>
+    <circle cx="373" cy="178" r="1"/>
+    <circle cx="314" cy="46"  r="1"/>
+    <circle cx="150" cy="41"  r="1.5"/>
+    <circle cx="40"  cy="148" r="1"/>
+    <circle cx="362" cy="248" r="1"/>
+  </g>
+
+  <!-- ── Shoggoth body (amorphous blob with pseudopod tentacles) ────── -->
+  <!-- Outer amorphous form -->
+  <path d="M 200,75 C 240,68 270,88 268,115 C 266,140 248,148 255,165
+           C 264,185 272,195 265,215 C 256,238 238,248 218,252
+           C 198,256 178,254 160,248 C 140,240 128,225 132,205
+           C 136,186 152,178 148,158 C 144,138 128,128 132,108
+           C 136,86 165,68 200,75 Z"
+        fill="#1e0d40" stroke="#6633cc" stroke-width="1.8"
+        filter="url(#glow)" opacity="0.90"/>
+
+  <!-- Pseudopod tentacles -->
+  <path d="M 268,115 C 285,108 295,98 290,85 C 285,78 276,80 268,90"
+        fill="#2a1055" stroke="#7744dd" stroke-width="1.2" opacity="0.65"/>
+  <path d="M 265,215 C 282,225 292,240 285,255 C 278,265 268,260 262,248"
+        fill="#2a1055" stroke="#7744dd" stroke-width="1.2" opacity="0.65"/>
+  <path d="M 132,108 C 112,100 100,88 108,75 C 114,65 124,68 130,80"
+        fill="#2a1055" stroke="#7744dd" stroke-width="1.2" opacity="0.65"/>
+  <path d="M 132,205 C 112,210 98,228 108,242 C 115,252 128,248 135,235"
+        fill="#2a1055" stroke="#7744dd" stroke-width="1.2" opacity="0.65"/>
+
+  <!-- ── Shoggoth eyes (glowing amber — hallmark of the entity) ─────── -->
+  <!-- Central large eye -->
+  <circle cx="200" cy="162" r="16" fill="#1a0820" stroke="#cc8822" stroke-width="1.5"
+          filter="url(#eyeglow)" opacity="0.92"/>
+  <circle cx="200" cy="162" r="9"  fill="#331500" stroke="#dd9933" stroke-width="1"/>
+  <circle cx="200" cy="162" r="4.5" fill="#ffaa00" filter="url(#eyeglow)" opacity="0.95"/>
+  <circle cx="197" cy="159" r="1.5" fill="#ffffff" opacity="0.70"/>
+
+  <!-- Left eye (smaller) -->
+  <circle cx="163" cy="148" r="10" fill="#1a0820" stroke="#cc8822" stroke-width="1.2"
+          filter="url(#glow)" opacity="0.80"/>
+  <circle cx="163" cy="148" r="5.5" fill="#331500"/>
+  <circle cx="163" cy="148" r="2.5" fill="#ffaa00" filter="url(#eyeglow)" opacity="0.85"/>
+
+  <!-- Right eye (smaller) -->
+  <circle cx="237" cy="148" r="10" fill="#1a0820" stroke="#cc8822" stroke-width="1.2"
+          filter="url(#glow)" opacity="0.80"/>
+  <circle cx="237" cy="148" r="5.5" fill="#331500"/>
+  <circle cx="237" cy="148" r="2.5" fill="#ffaa00" filter="url(#eyeglow)" opacity="0.85"/>
+
+  <!-- Two small eyes lower -->
+  <circle cx="178" cy="198" r="6" fill="#1a0820" stroke="#cc8822" stroke-width="1"
+          filter="url(#glow)" opacity="0.70"/>
+  <circle cx="178" cy="198" r="3" fill="#ffaa00" opacity="0.75"/>
+  <circle cx="222" cy="198" r="6" fill="#1a0820" stroke="#cc8822" stroke-width="1"
+          filter="url(#glow)" opacity="0.70"/>
+  <circle cx="222" cy="198" r="3" fill="#ffaa00" opacity="0.75"/>
+
+  <!-- ── TE classification bars (inside Shoggoth / below eyes) ─────── -->
+  <!-- LTR (green) -->
+  <rect x="154" y="216" width="54" height="7" rx="2"
+        fill="#2ec8a6" filter="url(#glow)" opacity="0.80"/>
+  <!-- DNA (blue) -->
+  <rect x="154" y="226" width="38" height="7" rx="2"
+        fill="#3d80c8" opacity="0.78"/>
+  <!-- LINE (amber) -->
+  <rect x="154" y="236" width="28" height="7" rx="2"
+        fill="#c8a83a" opacity="0.78"/>
+  <!-- SINE (pink) -->
+  <rect x="154" y="246" width="16" height="7" rx="2"
+        fill="#cc5588" opacity="0.75"/>
+
+  <g font-family="'Courier New',Courier,monospace" font-size="7.5" fill="#7755aa">
+    <text x="212" y="222">LTR</text>
+    <text x="196" y="232">DNA</text>
+    <text x="186" y="242">LINE</text>
+    <text x="174" y="252">SINE</text>
+  </g>
+
+  <!-- Separator -->
+  <line x1="105" y1="295" x2="295" y2="295" stroke="#2a1050" stroke-width="0.8"/>
+
+  <!-- Title -->
+  <text x="200" y="320"
+        font-family="'Courier New',Courier,monospace"
+        font-size="27" font-weight="bold"
+        fill="#e0d0ff" text-anchor="middle" letter-spacing="1.5"
+        filter="url(#textglow)">ShoggoTEh</text>
+
+  <text x="200" y="342"
+        font-family="'Courier New',Courier,monospace"
+        font-size="9.5" fill="#553388"
+        text-anchor="middle" letter-spacing="1.2">Hyena-DNA  ·  TE  ·  Classification</text>
+
+</svg>
