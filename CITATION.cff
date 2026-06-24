@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "ShoggoTEh"
+abstract: >
+  ShoggoTEh is a deep learning pipeline for identifying and classifying
+  transposable elements (TEs) in plant genomes. It uses Hyena-DNA to generate
+  sequence embeddings from genomic windows and trains a one-hidden-layer MLP
+  classifier to distinguish TE classes, genic, and intergenic regions without
+  relying on alignment-based repeat detection. Named after the Shoggoths
+  (H.P. Lovecraft) + TEh (transposable elements).
+authors:
+  - family-names: Bombarely
+    given-names: Aureliano
+    email: aubombarely@gmail.com
+    orcid: ""
+version: "v0.2.0"
+date-released: "2026-06-24"
+license: MIT
+repository-code: "https://github.com/aubombarely/ShoggoTEh"
+keywords:
+  - transposable elements
+  - deep learning
+  - DNA language model
+  - Hyena-DNA
+  - plant genomics
+  - repeat annotation
