@@ -50,3 +50,12 @@ All blueprint compliance gaps resolved in v0.2.0:
   `train_classifier.py` and `predict.py` always overwrite their outputs.
 - **GPU dependency**: steps 2–5 require Hyena-DNA model weights; only step 1 is covered by the
   quick test in `test/`.
+
+---
+
+## FAIR compliance status
+
+- [x] `LICENSE` — MIT, added 2026-06-24
+- [x] `CITATION.cff` — author, ORCID, version, keywords, repository URL
+- [ ] Zenodo DOI — mint after first public release; add `doi:` field to `CITATION.cff`
+- [ ] bio.tools registration — register after first public release
