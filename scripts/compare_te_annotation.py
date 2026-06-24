@@ -27,8 +27,15 @@ Output:
 """
 
 import argparse
+import getpass
+import json
 import logging
+import os
+import platform
+import resource
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -45,6 +52,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+VERSION = "v0.2.0"
+SCRIPT_NAME = "compare_te_annotation"
 
 # ── Label normalization (mirrors prepare_dataset.py) ──────────────────────────
 
@@ -282,6 +292,7 @@ def write_metrics(target_labels: list, ref_labels: list,
 
     log.info(f"Metrics written to {out_path}")
     log.info(f"Overall accuracy: {acc:.4f}")
+    return acc
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -290,6 +301,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Compare ShoggoTEh TE predictions against a reference annotation"
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("-t", "--target",    required=True,
                         help="Target BED file (ShoggoTEh predict.py output)")
     parser.add_argument("-r", "--reference", required=True,
@@ -302,16 +314,57 @@ def main():
                         help="Output filename prefix (default: target BED stem)")
     parser.add_argument("--min_fraction",    type=float, default=0.5,
                         help="Min overlap fraction to assign a reference label (default: 0.5)")
+    parser.add_argument("--dry_run", action="store_true",
+                        help="Validate inputs and print what would run, then exit without executing")
     args = parser.parse_args()
+
+    t_start = time.monotonic()
 
     target_path = Path(args.target)
     outdir      = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     prefix = args.prefix or target_path.stem
 
+    logs_dir = Path(args.outdir) / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"Run_{SCRIPT_NAME}.log"
+    sep = "=" * 62
+    with open(log_path, "w") as _fh:
+        _fh.write(f"{sep}\n  {SCRIPT_NAME} {VERSION}  —  Run Log\n{sep}\n")
+        _fh.write(f"Date      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        _fh.write(f"User      : {getpass.getuser()}\n")
+        _fh.write(f"Server    : {platform.node()}\n")
+        _fh.write(f"OS        : {platform.system()} {platform.release()} ({platform.machine()})\n")
+        _fh.write(f"Directory : {os.getcwd()}\n")
+        _fh.write(f"Command   : {' '.join(sys.argv)}\n")
+        _fh.write(f"{sep}\n\n")
+    _fh_handler = logging.FileHandler(log_path, mode="a")
+    _fh_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(_fh_handler)
+
+    if not target_path.exists():
+        print(f"ERROR: --target not found: {target_path}", file=sys.stderr)
+        sys.exit(1)
+    reference_path = Path(args.reference)
+    if not reference_path.exists():
+        print(f"ERROR: --reference not found: {reference_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.dry_run:
+        log.info("Dry run — no steps will be executed")
+        log.info(f"  target      : {target_path}")
+        log.info(f"  reference   : {reference_path}")
+        log.info(f"  gff3        : {args.gff3 or '(none)'}")
+        log.info(f"  outdir      : {outdir}/")
+        log.info(f"  prefix      : {prefix}")
+        log.info(f"  min_fraction: {args.min_fraction}")
+        log.info("  Steps that would run: load inputs → intersect → write comparison TSV → write metrics TSV")
+        log.info("  Exiting (--dry_run).")
+        sys.exit(0)
+
     # ── Load inputs ────────────────────────────────────────────────────────────
     target_df  = load_target(target_path)
-    repeats_df = load_reference_repeats(Path(args.reference))
+    repeats_df = load_reference_repeats(reference_path)
     genes_df   = load_genes(Path(args.gff3)) if args.gff3 else None
 
     if genes_df is None:
@@ -337,7 +390,8 @@ def main():
         target_labels.append(trow["label"])
         ref_labels.append(rrow["ref_label"])
 
-    log.info(f"Windows evaluated: {len(target_labels):,} | "
+    n_windows_evaluated = len(target_labels)
+    log.info(f"Windows evaluated: {n_windows_evaluated:,} | "
              f"excluded (ambiguous reference): {n_ambiguous:,}")
 
     if not target_labels:
@@ -346,7 +400,7 @@ def main():
         sys.exit(1)
 
     # ── Write metrics ──────────────────────────────────────────────────────────
-    write_metrics(
+    overall_accuracy = write_metrics(
         target_labels, ref_labels,
         n_ambiguous=n_ambiguous,
         used_gff3=genes_df is not None,
@@ -354,6 +408,35 @@ def main():
     )
 
     log.info("Done.")
+
+    elapsed_s = time.monotonic() - t_start
+    ru = resource.getrusage(resource.RUSAGE_SELF)
+    peak_mem_mb = ru.ru_maxrss / (1024 * 1024) if platform.system() == "Darwin" else ru.ru_maxrss / 1024
+    log.info(f"Wall-clock time   : {elapsed_s:.1f} s ({elapsed_s/60:.1f} min)")
+    log.info(f"Peak memory (RSS) : {peak_mem_mb:.1f} MB")
+
+    summary = {
+        "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": VERSION,
+        "target":    str(args.target),
+        "reference": str(args.reference),
+        "n_windows_evaluated": n_windows_evaluated,
+        "n_ambiguous":         n_ambiguous,
+        "overall_accuracy":    round(overall_accuracy, 4) if overall_accuracy is not None else None,
+        "parameters": {
+            "min_fraction": args.min_fraction,
+            "gff3":         args.gff3,
+        },
+        "resource_usage": {
+            "wall_clock_s": round(elapsed_s, 1),
+            "peak_mem_mb":  round(peak_mem_mb, 1),
+        },
+    }
+    summary_path = Path(args.outdir) / "run_summary.json"
+    with open(summary_path, "w") as fh:
+        json.dump(summary, fh, indent=2)
+        fh.write("\n")
+    log.info(f"Run summary written to {summary_path}")
 
 
 if __name__ == "__main__":

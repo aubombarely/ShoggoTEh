@@ -1,7 +1,17 @@
-# ShoggoTEh v0.1.0
+# ShoggoTEh
 
 <p align="center">
   <img src="assets/shoggoteh_logo.svg" width="260" alt="ShoggoTEh logo"/>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-v0.2.0-teal" alt="Version v0.2.0"/>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"/>
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
+</p>
+
+<p align="center">
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 A deep learning pipeline for identifying and classifying transposable elements (TEs) in plant genomes using DNA language model embeddings.
@@ -96,6 +106,9 @@ python scripts/prepare_dataset.py \
 | `--overlap` | `0.5` | Fractional overlap between windows |
 | `--min_fraction` | `0.5` | Min fraction of window covered to assign a label |
 | `--max_n_fraction` | `0.1` | Max N fraction allowed per chunk |
+| `--force` | off | Reprocess all species even if output Parquet already exists |
+| `--dry_run` | off | Validate inputs, print steps, exit without running |
+| `--disable_co2_tracking` | off | Skip codecarbon energy/CO₂ tracking for this run |
 
 Output: one Parquet file per species under `data/chunks/` with columns `species`, `chrom`, `start`, `end`, `sequence`, `label`, `repeat_fraction`.
 
@@ -112,6 +125,9 @@ python scripts/generate_embeddings.py \
 | `--model` | `LongSafari/hyenadna-medium-160k-seqlen-hf` | Hyena-DNA model on HuggingFace Hub |
 | `--batch_size` | `32` | Sequences per forward pass |
 | `--device` | auto | `cuda`, `mps`, or `cpu` |
+| `--force` | off | Reprocess all species even if output Parquet already exists |
+| `--dry_run` | off | Validate inputs, print steps, exit without running |
+| `--disable_co2_tracking` | off | Skip codecarbon energy/CO₂ tracking for this run |
 
 Output: one Parquet file per species under `data/embeddings/` with columns `species`, `chrom`, `start`, `end`, `label`, `repeat_fraction`, `embedding`. The `sequence` column is dropped to save space; it remains in the chunks Parquet.
 
@@ -133,6 +149,8 @@ python scripts/train_classifier.py \
 | `--val_fraction` | `0.2` | Fraction held out for validation (stratified) |
 | `--patience` | `10` | Early-stopping patience in epochs |
 | `--device` | auto | `cuda`, `mps`, or `cpu` |
+| `--dry_run` | off | Validate inputs, print steps, exit without running |
+| `--disable_co2_tracking` | off | Skip codecarbon energy/CO₂ tracking for this run |
 
 Output files in `--outdir`:
 
@@ -161,6 +179,8 @@ python scripts/predict.py \
 | `--max_n_fraction` | `0.1` | Windows above this N fraction are skipped |
 | `--batch_size` | `32` | Embedding batch size |
 | `--device` | auto | `cuda`, `mps`, or `cpu` |
+| `--dry_run` | off | Validate inputs, print steps, exit without running |
+| `--disable_co2_tracking` | off | Skip codecarbon energy/CO₂ tracking for this run |
 
 Output files in `--outdir`:
 
@@ -193,6 +213,7 @@ python scripts/compare_te_annotation.py \
 | `--gff3` | None | Gene annotation GFF3 — resolves `Genic` vs `Intergenic` for non-repeat windows |
 | `--prefix` | target BED stem | Output filename prefix |
 | `--min_fraction` | `0.5` | Min overlap fraction to assign a reference label |
+| `--dry_run` | off | Validate inputs, print steps, exit without running |
 
 Reference labels are normalised to the ShoggoTEh label set using the same `REPEAT_CLASS_MAP` as `prepare_dataset.py` (`LTR/Gypsy` → `LTR`, `DNA/hAT` → `DNA`, etc.). Windows where no single repeat class reaches `--min_fraction` are marked `Ambiguous`, reported in the comparison file, and excluded from the metrics.
 
@@ -203,9 +224,67 @@ Output files in `--outdir`:
 | `{prefix}_comparison.tsv` | Per-window detail: target label, reference label, overlap bp and fraction, match (True/False) |
 | `{prefix}_metrics.tsv` | Per-class precision, recall, F1 and support; macro and weighted averages; overall accuracy; confusion matrix |
 
+## Run log
+
+Every script writes a run log to `{outdir}/logs/Run_{script}.log`. The header records:
+
+```
+## Run: prepare_dataset.py
+## Date: 2026-06-24 10:00:00
+## User: aubombarely
+## Server: my-workstation
+## OS: Linux-5.15.0
+## Working directory: /home/aubombarely/ShoggoTEh
+## Command: python scripts/prepare_dataset.py --species_tsv data/species.tsv --outdir data/chunks/
+```
+
+All subsequent `log.info()` messages are captured in the same file.
+
+## Run summary
+
+Every script writes `{outdir}/run_summary.json` at the end of a successful run. It records date, script version, key inputs, result counts, parameters, and resource usage:
+
+```json
+{
+  "script": "prepare_dataset.py",
+  "version": "v0.2.0",
+  "date": "2026-06-24T10:05:12",
+  "n_species": 3,
+  "n_windows_total": 12450,
+  "wall_time_s": 47.3,
+  "peak_rss_mb": 284.1,
+  "co2_eq_kg": 0.000021
+}
+```
+
 ## Carbon footprint tracking
 
-ShoggoTEh tracks energy consumption and CO2 equivalent emissions for each script using [CodeCarbon](https://github.com/mlco2/codecarbon). Emissions are logged to `logs/emissions.csv` after each run and printed at the end of the log output.
+ShoggoTEh tracks energy consumption and CO₂ equivalent emissions for scripts that run ML workloads (`prepare_dataset.py`, `generate_embeddings.py`, `train_classifier.py`, `predict.py`) using [CodeCarbon](https://github.com/mlco2/codecarbon).
+
+- `codecarbon` is an **optional dependency** — the pipeline runs normally without it.
+- Pass `--disable_co2_tracking` to skip tracking for a specific run (e.g. on cluster nodes that block network access).
+- Emissions are reported in the run log and included in `run_summary.json` as `co2_eq_kg`.
+
+## Test data
+
+A small synthetic dataset is provided in `test/` for validating `prepare_dataset.py` without downloading Hyena-DNA model weights.
+
+```bash
+# Generate (or regenerate) test files
+python3 test/make_test_data.py
+
+# Quick test — no GPU required, runs in < 30 s
+conda activate shoggoTEh
+python3 scripts/prepare_dataset.py \
+    --species_tsv test/species.tsv \
+    --outdir test/chunks/ \
+    --chunk_size 5000 \
+    --overlap 0.5
+```
+
+Expected output: `test/chunks/test_species.parquet` (~15–25 labeled windows), `test/chunks/logs/Run_prepare_dataset.log`, `test/chunks/run_summary.json`.
+
+Steps 2–5 require the Hyena-DNA model weights (~1.5 GB from HuggingFace) and benefit from a GPU; see `test/README.md` for the full end-to-end test sequence.
 
 ## Configuration
 
