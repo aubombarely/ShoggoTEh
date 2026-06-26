@@ -17,7 +17,7 @@ Output (prefix defaults to the FASTA filename stem):
     {outdir}/{prefix}_probs.tsv    — full softmax probability matrix
 """
 
-import argparse
+import argparse, warnings
 import getpass
 import json
 import logging
@@ -200,6 +200,7 @@ def write_probs_tsv(windows, top_labels, confidences, probs, labels,
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
+    warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
     _print_quote()
     parser = argparse.ArgumentParser(
         description="Predict TE classes for a genome using a trained ShoggoTEh model"
