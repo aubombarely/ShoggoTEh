@@ -53,6 +53,24 @@ VERSION = "v0.2.0"
 SCRIPT_NAME = "predict"
 
 
+_QUOTE_LINES = [
+    "\"It was a terrible, indescribable thing vaster than any subway train —",
+    " a shapeless congeries of protoplasmic bubbles, faintly self-luminous,",
+    " and with myriads of temporary eyes forming and unforming as pustules",
+    " of greenish light all over the tunnel-filling front that bore down upon us.\"",
+    "                  — H.P. Lovecraft, At the Mountains of Madness (1931)",
+]
+
+def _print_quote() -> None:
+    width = max(len(l) for l in _QUOTE_LINES) + 4
+    border = "─" * width
+    print(f"┌{border}┐", file=sys.stderr)
+    for line in _QUOTE_LINES:
+        padding = width - len(line) - 1
+        print(f"│ {line}{' ' * padding}│", file=sys.stderr)
+    print(f"└{border}┘", file=sys.stderr)
+
+
 # ── Classifier architecture (must match train_classifier.py) ──────────────────
 
 class TEClassifier(nn.Module):
@@ -182,6 +200,7 @@ def write_probs_tsv(windows, top_labels, confidences, probs, labels,
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
+    _print_quote()
     parser = argparse.ArgumentParser(
         description="Predict TE classes for a genome using a trained ShoggoTEh model"
     )
