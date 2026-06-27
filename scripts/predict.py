@@ -200,7 +200,7 @@ def write_probs_tsv(windows, top_labels, confidences, probs, labels,
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
+    warnings.filterwarnings("ignore", category=FutureWarning, message=".*pynvml.*")
     _print_quote()
     parser = argparse.ArgumentParser(
         description="Predict TE classes for a genome using a trained ShoggoTEh model"
