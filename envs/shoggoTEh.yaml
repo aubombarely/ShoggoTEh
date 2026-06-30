@@ -10,6 +10,7 @@ dependencies:
   - pyarrow
   - pyfaidx
   - pybedtools
+  - scikit-learn
   - pip
   - pip:
       - torch>=2.0
