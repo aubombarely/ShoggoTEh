@@ -35,6 +35,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, TensorDataset
 
 try:
@@ -121,9 +122,10 @@ def train(
     lr: float,
     patience: int,
     outdir: Path,
+    class_weights: torch.Tensor | None = None,
 ) -> list[dict]:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     best_val_loss = float("inf")
     epochs_no_improve = 0
@@ -235,6 +237,14 @@ def main():
         help="Early-stopping patience in epochs (default: 10)",
     )
     parser.add_argument(
+        "--class_weight", choices=["balanced", "none"], default="balanced",
+        help="'balanced' (default) weights CrossEntropyLoss by inverse "
+             "training-set class frequency, so rare TE classes (e.g. SINE, "
+             "LINE, DNA) are not drowned out by common ones (Genic, "
+             "Intergenic). Use 'none' to disable and match plain "
+             "unweighted CrossEntropyLoss.",
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed (default: 42)",
     )
@@ -289,6 +299,7 @@ def main():
         log.info(f"  dropout        : {args.dropout}")
         log.info(f"  val_fraction   : {args.val_fraction}")
         log.info(f"  patience       : {args.patience}")
+        log.info(f"  class_weight   : {args.class_weight}")
         log.info(f"  labels         : {args.labels}")
         log.info("  Steps that would run: load embeddings → train MLP → evaluate → save model")
         log.info("  Exiting (--dry_run).")
@@ -314,6 +325,25 @@ def main():
         random_state=args.seed,
     )
     log.info(f"Train: {len(X_train):,} | Val: {len(X_val):,}")
+
+    class_weights = None
+    if args.class_weight == "balanced":
+        present_classes = np.unique(y_train)
+        weights_for_present = compute_class_weight(
+            class_weight="balanced", classes=present_classes, y=y_train
+        )
+        # compute_class_weight only covers classes actually present in
+        # y_train; any configured label with zero training examples gets
+        # weight 1.0 (CrossEntropyLoss never sees it anyway in that case).
+        full_weights = np.ones(len(labels), dtype=np.float32)
+        for cls_idx, w in zip(present_classes, weights_for_present):
+            full_weights[cls_idx] = w
+        class_weights = torch.tensor(full_weights, dtype=torch.float32).to(device)
+        log.info("Class weights (balanced, inverse training-set frequency):")
+        for lbl, w in zip(labels, full_weights):
+            log.info(f"    {lbl:15s} weight={w:.4f}")
+    else:
+        log.info("Class weighting disabled (--class_weight none)")
 
     train_ds = TensorDataset(
         torch.tensor(X_train, dtype=torch.float32),
@@ -370,6 +400,7 @@ def main():
         lr=args.lr,
         patience=args.patience,
         outdir=outdir,
+        class_weights=class_weights,
     )
 
     emissions_kg = None
@@ -440,6 +471,7 @@ def main():
             "dropout":      args.dropout,
             "val_fraction": args.val_fraction,
             "patience":     args.patience,
+            "class_weight": args.class_weight,
             "seed":         args.seed,
         },
         "resource_usage": {
