@@ -1,0 +1,1833 @@
+#!/usr/bin/env python3
+"""
+ShoggoTEh.py  —  Deep-learning TE annotation pipeline (Shoggoth + TEh)
+
+Sub-commands
+------------
+  prepare_dataset        Slide windows across each genome, label every
+                          small bin (default 50bp) by the exact repeat/gene
+                          interval it falls in (dense, per-bin labeling —
+                          no majority-vote window discard).
+                          Output: {outdir}/{species}.parquet
+  generate_embeddings    Run labeled chunks through Hyena-DNA and pool the
+                          per-nucleotide hidden states into per-bin
+                          embeddings ([n_bins, hidden_dim] per chunk).
+                          Output: {outdir}/{species}.parquet
+  train_classifier       Train a 1D-CNN + linear-chain CRF sequence
+                          labeler on the per-bin embeddings.
+                          Output: {outdir}/classifier.pt, label_encoder.json,
+                                  model_config.json
+  predict                Slide windows across a new genome, embed, run the
+                          dense CNN+CRF forward pass + Viterbi decode, and
+                          run-length-encode consecutive same-label bins into
+                          BED intervals.
+                          Output: {outdir}/{prefix}.bed,
+                                  {outdir}/{prefix}_bin_probs.tsv
+  compare_te_annotation  Benchmark predictions against a reference BED
+                          annotation (e.g. EarlGrey filteredRepeats.bed).
+                          Output: {outdir}/{prefix}_comparison.tsv,
+                                  {outdir}/{prefix}_metrics.tsv
+
+Architecture note
+------------------
+This is the "dense (per-bin)" redesign of ShoggoTEh: instead of
+mean-pooling an entire 5kb window into one vector and predicting a single
+label for it (which structurally fails for short, dispersed classes like
+SINE — see docs/ideas or the project changelog), Hyena-DNA's per-nucleotide
+hidden states are pooled into small bins (default 50bp) and every bin gets
+its own label and its own prediction. A light 1D-CNN smooths local context
+across bins, and a linear-chain CRF (implemented from scratch — transition
+matrix + forward algorithm + Viterbi decode) discourages single-bin
+"flapping" misclassifications inside otherwise-uniform runs. Consecutive
+same-label bins are then run-length-encoded back into BED intervals at
+prediction time, so downstream consumers (compare_te_annotation.py,
+EarlGrey-style analyses) see no format change.
+
+Usage
+-----
+  python3 scripts/ShoggoTEh.py prepare_dataset --species_tsv ... --outdir ...
+  python3 scripts/ShoggoTEh.py generate_embeddings --chunks_dir ... --outdir ...
+  python3 scripts/ShoggoTEh.py train_classifier --embeddings_dir ... --outdir ...
+  python3 scripts/ShoggoTEh.py predict --fasta ... --model_dir ... --outdir ...
+  python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
+"""
+
+VERSION = "v0.3.0"
+
+import argparse
+import getpass
+import json
+import os
+import platform
+import resource
+import sys
+import time
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pybedtools
+from pyfaidx import Fasta
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+
+try:
+    from codecarbon import EmissionsTracker
+    _CODECARBON_AVAILABLE = True
+except ImportError:
+    _CODECARBON_AVAILABLE = False
+
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+_LOG_FH = None
+
+
+def _log(msg: str) -> None:
+    ts   = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, file=sys.stderr)
+    if _LOG_FH is not None:
+        print(line, file=_LOG_FH, flush=True)
+
+
+def _banner(title: str) -> None:
+    bar = "─" * (len(title) + 4)
+    _log(f"┌{bar}┐")
+    _log(f"│  {title}  │")
+    _log(f"└{bar}┘")
+
+
+_QUOTE_LINES = [
+    "\"It was a terrible, indescribable thing vaster than any subway train —",
+    " a shapeless congeries of protoplasmic bubbles, faintly self-luminous,",
+    " and with myriads of temporary eyes forming and unforming as pustules",
+    " of greenish light all over the tunnel-filling front that bore down upon us.\"",
+    "                  — H.P. Lovecraft, At the Mountains of Madness (1931)",
+]
+
+
+def _print_quote() -> None:
+    width = max(len(l) for l in _QUOTE_LINES) + 4
+    border = "─" * width
+    _log(f"┌{border}┐")
+    for line in _QUOTE_LINES:
+        padding = width - len(line) - 1
+        _log(f"│ {line}{' ' * padding}│")
+    _log(f"└{border}┘")
+
+
+# ── Checkpoint / external tools ────────────────────────────────────────────────
+
+def _checkpoint(path: Path, label: str, force: bool) -> bool:
+    if not force and path.exists() and path.stat().st_size > 0:
+        _log(f"  [checkpoint] {label} — {path.name} already exists, skipping")
+        return True
+    return False
+
+
+# ── Input validation ──────────────────────────────────────────────────────────
+
+def _validate_inputs(pairs: list) -> None:
+    ok = True
+    for flag, path in pairs:
+        if path is not None and not Path(path).exists():
+            print(f"ERROR: {flag} not found: {path}", file=sys.stderr)
+            ok = False
+    if not ok:
+        sys.exit(1)
+
+
+# ── Log file / run infrastructure ──────────────────────────────────────────────
+
+def _open_log(logs_dir: Path, command: str) -> None:
+    """Open the per-subcommand run log. Filename includes the subcommand
+    name since ShoggoTEh.py is a single multi-subcommand entry point and
+    each subcommand typically writes to its own --outdir anyway."""
+    global _LOG_FH
+    log_path = logs_dir / f"Run_ShoggoTEh_{command}.log"
+    _LOG_FH  = open(log_path, "w")
+    sep = "=" * 62
+    _LOG_FH.write(f"{sep}\n  ShoggoTEh {VERSION}  —  {command}  —  Run Log\n{sep}\n")
+    _LOG_FH.write(f"Date      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    _LOG_FH.write(f"User      : {getpass.getuser()}\n")
+    _LOG_FH.write(f"Server    : {platform.node()}\n")
+    _LOG_FH.write(f"OS        : {platform.system()} {platform.release()} "
+                  f"({platform.machine()})\n")
+    _LOG_FH.write(f"Directory : {os.getcwd()}\n")
+    _LOG_FH.write(f"Command   : {' '.join(sys.argv)}\n")
+    _LOG_FH.write(f"{sep}\n\n")
+    _LOG_FH.flush()
+
+
+def _close_log() -> None:
+    global _LOG_FH
+    if _LOG_FH is not None:
+        _LOG_FH.close()
+        _LOG_FH = None
+
+
+def _peak_mem_mb() -> float:
+    ru = resource.getrusage(resource.RUSAGE_SELF)
+    return (ru.ru_maxrss / (1024 * 1024) if platform.system() == "Darwin"
+            else ru.ru_maxrss / 1024)
+
+
+def _start_tracker(project_name: str, logs_dir: Path, disable: bool):
+    if disable:
+        _log("  Carbon footprint tracking disabled (--disable_co2_tracking)")
+        return None
+    if not _CODECARBON_AVAILABLE:
+        _log("  codecarbon not installed — carbon tracking skipped "
+             "(conda install -c conda-forge codecarbon)")
+        return None
+    tracker = EmissionsTracker(
+        project_name=project_name,
+        output_dir=str(logs_dir),
+        log_level="error",
+    )
+    tracker.start()
+    _log("  codecarbon tracker started")
+    return tracker
+
+
+def _stop_tracker(tracker):
+    if tracker is None:
+        return None
+    try:
+        return tracker.stop()
+    except Exception:
+        return None
+
+
+def _write_summary(outdir: Path, summary: dict) -> Path:
+    summary_path = Path(outdir) / "run_summary.json"
+    with open(summary_path, "w") as fh:
+        json.dump(summary, fh, indent=2)
+        fh.write("\n")
+    _log(f"Run summary written to {summary_path}")
+    return summary_path
+
+
+# ── Repeat class mapping (shared across prepare_dataset / compare_te_annotation) ──
+
+REPEAT_CLASS_MAP = {
+    "LTR":            "LTR",
+    "DNA":            "DNA",
+    "LINE":           "LINE",
+    "SINE":           "SINE",
+    "RC":             "DNA",             # Rolling Circle / Helitron
+    "Unknown":        "Unknown_repeat",
+    "Satellite":      "Other_repeat",
+    "Simple_repeat":  "Other_repeat",
+    "Low_complexity": "Other_repeat",
+}
+
+# Full label vocabulary shared by train_classifier (default) and
+# compare_te_annotation (reference-label normalisation target).
+DEFAULT_LABELS = ["LTR", "DNA", "LINE", "SINE", "Unknown_repeat",
+                  "Other_repeat", "Genic", "Intergenic"]
+
+
+def map_repeat_class(classification: str) -> str:
+    top = str(classification).split("/")[0]
+    return REPEAT_CLASS_MAP.get(top, "Other_repeat")
+
+
+# ── Windowing (shared: prepare_dataset + predict) ──────────────────────────────
+
+def make_windows(fasta: Fasta, chunk_size: int, stride: int) -> list:
+    """Generate sliding windows across all scaffolds long enough."""
+    windows = []
+    for chrom in fasta.keys():
+        chrom_len = len(fasta[chrom])
+        if chrom_len < chunk_size:
+            continue
+        start = 0
+        while start + chunk_size <= chrom_len:
+            windows.append((chrom, start, start + chunk_size))
+            start += stride
+        remainder = chrom_len - start
+        if 0 < remainder >= chunk_size // 2:
+            windows.append((chrom, chrom_len - chunk_size, chrom_len))
+    return windows
+
+
+###############################################################################
+# prepare_dataset
+###############################################################################
+
+def load_repeats(bed_path: str) -> pd.DataFrame:
+    df = pd.read_csv(
+        bed_path, sep="\t", header=None, usecols=[0, 1, 2, 3],
+        names=["chrom", "start", "end", "classification"],
+        dtype={"chrom": str, "start": int, "end": int, "classification": str},
+    )
+    df["label"] = df["classification"].apply(map_repeat_class)
+    return df
+
+
+def _check_chroms(species_id: str, fasta: Fasta,
+                  repeats_df: pd.DataFrame, genes_df) -> None:
+    fasta_chroms = set(fasta.keys())
+
+    bed_chroms = set(repeats_df["chrom"].unique())
+    shared_bed = fasta_chroms & bed_chroms
+    if not shared_bed:
+        raise ValueError(
+            f"No chromosome names in common between FASTA and BED.\n"
+            f"  FASTA examples : {sorted(fasta_chroms)[:5]}\n"
+            f"  BED examples   : {sorted(bed_chroms)[:5]}\n"
+            f"Check that both files use the same naming convention (e.g. 'Chr1' vs '1')."
+        )
+    unmatched_bed = bed_chroms - fasta_chroms
+    if unmatched_bed:
+        _log(f"  WARNING {species_id}: {len(unmatched_bed)} BED chromosome(s) "
+             f"not found in FASTA (e.g. {sorted(unmatched_bed)[:3]}) — ignored.")
+
+    if genes_df is not None:
+        gff_chroms = set(genes_df["chrom"].unique())
+        shared_gff = fasta_chroms & gff_chroms
+        if not shared_gff:
+            raise ValueError(
+                f"No chromosome names in common between FASTA and GFF3.\n"
+                f"  FASTA examples : {sorted(fasta_chroms)[:5]}\n"
+                f"  GFF3 examples  : {sorted(gff_chroms)[:5]}\n"
+            )
+        unmatched_gff = gff_chroms - fasta_chroms
+        if unmatched_gff:
+            _log(f"  WARNING {species_id}: {len(unmatched_gff)} GFF3 chromosome(s) "
+                 f"not found in FASTA (e.g. {sorted(unmatched_gff)[:3]}) — ignored.")
+
+
+def label_bins(windows: list, bin_size: int, chunk_size: int,
+               repeats_df: pd.DataFrame, genes_df) -> tuple:
+    """
+    Dense per-bin labeling. Every bin (default 50bp) is assigned the label
+    of whichever repeat interval it overlaps most (no window-level
+    min_fraction threshold — the majority-vote/mixed-window-discard logic
+    of the old window-level label_windows() is retired). Bins with no
+    repeat overlap are refined into Genic/Intergenic by gene-model overlap
+    dominance within the bin.
+
+    Returns (window_bin_labels, n_bins) where window_bin_labels maps
+    (chrom, start, end) -> list[str] of length n_bins.
+    """
+    if chunk_size % bin_size != 0:
+        raise ValueError(
+            f"--chunk_size ({chunk_size}) must be a multiple of --bin_size "
+            f"({bin_size}) so bins tile each window exactly."
+        )
+    n_bins = chunk_size // bin_size
+
+    bin_rows = []  # (chrom, start, end, uid)
+    uid = 0
+    for chrom, start, end in windows:
+        for i in range(n_bins):
+            bstart = start + i * bin_size
+            bend = bstart + bin_size
+            bin_rows.append((chrom, bstart, bend, uid))
+            uid += 1
+    n_total_bins = uid
+
+    bins_df = pd.DataFrame(bin_rows, columns=["chrom", "start", "end", "uid"])
+    bins_bed = pybedtools.BedTool.from_dataframe(bins_df)
+    rep_bed = pybedtools.BedTool.from_dataframe(
+        repeats_df[["chrom", "start", "end", "label"]]
+    )
+
+    intersect = bins_bed.intersect(rep_bed, wao=True)
+    overlaps: dict = {}
+    for feat in intersect:
+        bin_uid   = int(feat.fields[3])
+        rep_class = feat.fields[7]
+        bp        = int(feat.fields[8])
+        if rep_class != "." and bp > 0:
+            overlaps.setdefault(bin_uid, {})
+            overlaps[bin_uid][rep_class] = overlaps[bin_uid].get(rep_class, 0) + bp
+
+    bin_labels = ["Non_repeat"] * n_total_bins
+    for u, ovlp in overlaps.items():
+        bin_labels[u] = max(ovlp, key=ovlp.get)
+
+    non_rep_uids = [u for u in range(n_total_bins) if bin_labels[u] == "Non_repeat"]
+    if genes_df is not None and non_rep_uids:
+        nr_rows = [bin_rows[u] for u in non_rep_uids]
+        nr_df   = pd.DataFrame(nr_rows, columns=["chrom", "start", "end", "uid"])
+        nr_bed  = pybedtools.BedTool.from_dataframe(nr_df)
+        gene_bed = pybedtools.BedTool.from_dataframe(genes_df[["chrom", "start", "end"]])
+        gene_intersect = nr_bed.intersect(gene_bed, wao=True)
+        gene_bp: dict = {}
+        for feat in gene_intersect:
+            bin_uid = int(feat.fields[3])
+            bp = int(feat.fields[-1])
+            if bp > 0:
+                gene_bp[bin_uid] = gene_bp.get(bin_uid, 0) + bp
+        for u in non_rep_uids:
+            bstart, bend = bin_rows[u][1], bin_rows[u][2]
+            bin_len = bend - bstart
+            bin_labels[u] = "Genic" if gene_bp.get(u, 0) >= bin_len / 2 else "Intergenic"
+    else:
+        for u in non_rep_uids:
+            bin_labels[u] = "Intergenic"
+
+    window_bin_labels = {}
+    idx = 0
+    for w in windows:
+        window_bin_labels[tuple(w)] = bin_labels[idx: idx + n_bins]
+        idx += n_bins
+
+    pybedtools.cleanup()
+    return window_bin_labels, n_bins
+
+
+def process_species_prepare(species_id: str, fasta_path: str, bed_path: str,
+                            gff3_path, chunk_size: int, stride: int,
+                            bin_size: int, max_n_fraction: float,
+                            outdir: Path, force: bool) -> int:
+    out_path = outdir / f"{species_id}.parquet"
+    if _checkpoint(out_path, f"prepare_dataset:{species_id}", force):
+        return 0
+
+    _log(f"{species_id}: loading genome")
+    fasta = Fasta(fasta_path)
+
+    _log(f"{species_id}: generating windows (chunk={chunk_size}, stride={stride})")
+    windows = make_windows(fasta, chunk_size, stride)
+    _log(f"{species_id}: {len(windows):,} windows generated")
+
+    _log(f"{species_id}: loading repeat annotations")
+    repeats_df = load_repeats(bed_path)
+
+    genes_df = None
+    if gff3_path and Path(gff3_path).exists():
+        _log(f"{species_id}: loading gene annotations")
+        gff = pd.read_csv(
+            gff3_path, sep="\t", comment="#", header=None,
+            names=["chrom", "source", "feature", "start", "end",
+                   "score", "strand", "frame", "attributes"],
+            dtype={"chrom": str},
+        )
+        genes_df = gff[gff["feature"] == "gene"][["chrom", "start", "end"]].copy()
+        genes_df["start"] = genes_df["start"] - 1  # GFF3 is 1-based
+
+    _check_chroms(species_id, fasta, repeats_df, genes_df)
+
+    _log(f"{species_id}: labeling bins (bin_size={bin_size})")
+    window_bin_labels, n_bins = label_bins(windows, bin_size, chunk_size,
+                                           repeats_df, genes_df)
+
+    _log(f"{species_id}: extracting sequences")
+    records = []
+    skipped_n = 0
+    for win in windows:
+        chrom, start, end = win
+        seq = str(fasta[chrom][start:end]).upper()
+        n_frac = seq.count("N") / len(seq)
+        if n_frac > max_n_fraction:
+            skipped_n += 1
+            continue
+        bin_labels = window_bin_labels[tuple(win)]
+        repeat_fraction = sum(1 for l in bin_labels if l not in ("Genic", "Intergenic")) / n_bins
+        records.append({
+            "species":         species_id,
+            "chrom":           chrom,
+            "start":           start,
+            "end":             end,
+            "sequence":        seq,
+            "bin_labels":      bin_labels,
+            "n_bins":          n_bins,
+            "bin_size":        bin_size,
+            "repeat_fraction": round(repeat_fraction, 4),
+        })
+
+    _log(f"{species_id}: {len(records):,} chunks kept | "
+         f"{skipped_n:,} skipped (N content)")
+
+    df = pd.DataFrame(records)
+    if len(df):
+        all_bin_labels = [l for row in df["bin_labels"] for l in row]
+        dist = Counter(all_bin_labels)
+        _log(f"{species_id}: bin label distribution — {dict(dist)}")
+        df = df.sort_values(["chrom", "start"]).reset_index(drop=True)
+
+    df.to_parquet(out_path, index=False)
+    _log(f"{species_id}: written to {out_path}")
+
+    pybedtools.cleanup()
+    return len(records)
+
+
+def run_prepare_dataset(args) -> None:
+    args.species_tsv = args.species_tsv.resolve()
+    outdir = args.outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    logs_dir = outdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _open_log(logs_dir, "prepare_dataset")
+
+    _validate_inputs([("--species_tsv", args.species_tsv)])
+
+    if args.chunk_size % args.bin_size != 0:
+        print(f"ERROR: --chunk_size ({args.chunk_size}) must be a multiple of "
+              f"--bin_size ({args.bin_size})", file=sys.stderr)
+        sys.exit(1)
+
+    stride = int(args.chunk_size * (1 - args.overlap))
+
+    if args.dry_run:
+        _banner("Dry run — no steps will be executed")
+        _log(f"  species_tsv    : {args.species_tsv}")
+        _log(f"  outdir         : {outdir}/")
+        _log(f"  chunk_size     : {args.chunk_size}")
+        _log(f"  bin_size       : {args.bin_size}")
+        _log(f"  overlap        : {args.overlap}")
+        _log(f"  max_n_fraction : {args.max_n_fraction}")
+        _log(f"  force          : {args.force}")
+        _log("  Steps that would run: process each species from species_tsv "
+             "(dense per-bin labeling)")
+        _log("  Exiting (--dry_run).")
+        sys.exit(0)
+
+    if args.force:
+        _log("--force set: all species will be reprocessed regardless of "
+             "existing outputs")
+    elif outdir.exists() and any(outdir.iterdir()):
+        _log("Existing outdir found — resuming from checkpoints "
+             "(use --force to rerun all species from scratch)")
+
+    species_df = pd.read_csv(
+        args.species_tsv, sep="\t", comment="#", header=None,
+        names=["species_id", "fasta", "bed", "gff3"],
+    )
+
+    t_start = time.monotonic()
+    tracker = _start_tracker("ShoggoTEh_prepare_dataset", logs_dir, args.disable_co2_tracking)
+
+    n_species_processed = 0
+    total_records = 0
+    for _, row in species_df.iterrows():
+        gff3 = row.get("gff3")
+        gff3 = None if pd.isna(gff3) or str(gff3).strip().upper() == "NA" else str(gff3)
+        try:
+            n_records = process_species_prepare(
+                species_id=str(row["species_id"]),
+                fasta_path=str(row["fasta"]),
+                bed_path=str(row["bed"]),
+                gff3_path=gff3,
+                chunk_size=args.chunk_size,
+                stride=stride,
+                bin_size=args.bin_size,
+                max_n_fraction=args.max_n_fraction,
+                outdir=outdir,
+                force=args.force,
+            )
+            n_species_processed += 1
+            total_records += n_records
+        except Exception as exc:
+            _log(f"  ERROR {row['species_id']}: FAILED — {exc}")
+            continue
+
+    emissions_kg = _stop_tracker(tracker)
+    elapsed_s   = time.monotonic() - t_start
+    peak_mem_mb = _peak_mem_mb()
+    _log(f"Wall-clock time   : {elapsed_s:.1f} s ({elapsed_s/60:.1f} min)")
+    _log(f"Peak memory (RSS) : {peak_mem_mb:.1f} MB")
+
+    summary = {
+        "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": VERSION,
+        "input_species_tsv":    str(args.species_tsv),
+        "n_species_processed":  n_species_processed,
+        "total_records_written": total_records,
+        "parameters": {
+            "chunk_size":     args.chunk_size,
+            "bin_size":       args.bin_size,
+            "overlap":        args.overlap,
+            "max_n_fraction": args.max_n_fraction,
+        },
+        "resource_usage": {
+            "wall_clock_s":       round(elapsed_s, 1),
+            "peak_mem_mb":        round(peak_mem_mb, 1),
+            "emissions_kg_CO2eq": emissions_kg,
+        },
+    }
+    _write_summary(outdir, summary)
+    _close_log()
+
+
+###############################################################################
+# generate_embeddings
+###############################################################################
+
+def load_hyena_model(model_name: str, device):
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+    _log(f"Loading tokenizer and model: {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    model.eval()
+    model.to(device)
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    _log(f"Model ready on {device} ({n_params:.1f}M parameters)")
+    return tokenizer, model
+
+
+def embed_sequences_dense(sequences: list, n_bins: int, bin_size: int,
+                          tokenizer, model, device, batch_size: int) -> list:
+    """
+    Run sequences through Hyena-DNA (frozen) and pool per-nucleotide hidden
+    states into per-bin embeddings. Returns a list of np.ndarray, each of
+    shape (n_bins, hidden_dim), one per input sequence.
+
+    Tokenizer footnote: HyenaDNA's tokenizer appends a trailing EOS/SEP
+    token by default (seq_len + 1 tokens). That trailing special-token
+    position is dropped before bin-pooling so bin boundaries map correctly
+    back to genomic coordinates (see plan's "Tokenizer footnote").
+    """
+    import torch
+
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is None:
+        eos_id = getattr(tokenizer, "sep_token_id", None)
+
+    results = []
+    n = len(sequences)
+    need = n_bins * bin_size
+
+    for batch_start in range(0, n, batch_size):
+        batch_seqs = sequences[batch_start: batch_start + batch_size]
+        enc = tokenizer(batch_seqs, return_tensors="pt", padding=True, truncation=True)
+        enc = {k: v.to(device) for k, v in enc.items()}
+
+        with torch.no_grad():
+            out = model(**enc)
+        hidden = out.last_hidden_state  # (B, L, D)
+        attn = enc.get("attention_mask")
+
+        for i in range(len(batch_seqs)):
+            valid_len = int(attn[i].sum().item()) if attn is not None else hidden.shape[1]
+            seq_len_nt = valid_len - 1 if eos_id is not None else valid_len
+            seq_hidden = hidden[i, :seq_len_nt, :]
+
+            if seq_hidden.shape[0] < need:
+                pad = need - seq_hidden.shape[0]
+                seq_hidden = torch.nn.functional.pad(seq_hidden, (0, 0, 0, pad))
+            else:
+                seq_hidden = seq_hidden[:need]
+
+            pooled = seq_hidden.reshape(n_bins, bin_size, -1).mean(dim=1)  # (n_bins, D)
+            results.append(pooled.cpu().float().numpy())
+
+        done = min(batch_start + batch_size, n)
+        if done % (batch_size * 10) == 0 or done == n:
+            _log(f"  {done:,} / {n:,} sequences embedded")
+
+    return results
+
+
+def process_species_embed(chunks_path: Path, outdir: Path, tokenizer, model,
+                          device, bin_size: int, batch_size: int, force: bool) -> int:
+    species_id = chunks_path.stem
+    out_path   = outdir / f"{species_id}.parquet"
+    if _checkpoint(out_path, f"generate_embeddings:{species_id}", force):
+        return 0
+
+    _log(f"{species_id}: loading chunks from {chunks_path}")
+    df = pd.read_parquet(chunks_path)
+    _log(f"{species_id}: {len(df):,} chunks to embed")
+
+    n_bins_vals = df["n_bins"].unique()
+    if len(n_bins_vals) > 1:
+        raise ValueError(f"{species_id}: inconsistent n_bins values in chunks "
+                         f"file: {n_bins_vals}")
+    n_bins = int(n_bins_vals[0])
+
+    bin_size_vals = df["bin_size"].unique()
+    if len(bin_size_vals) > 1 or int(bin_size_vals[0]) != bin_size:
+        raise ValueError(f"{species_id}: chunk bin_size ({bin_size_vals}) does not "
+                         f"match --bin_size ({bin_size})")
+
+    sequences = df["sequence"].tolist()
+    _log(f"{species_id}: generating dense per-bin embeddings "
+         f"(n_bins={n_bins}, bin_size={bin_size}, batch_size={batch_size})")
+    pooled_list = embed_sequences_dense(sequences, n_bins, bin_size,
+                                        tokenizer, model, device, batch_size)
+    hidden_dim = pooled_list[0].shape[1]
+    _log(f"{species_id}: hidden dim = {hidden_dim}")
+
+    df = df.drop(columns=["sequence"])
+    df["embedding_flat"] = [p.flatten().tolist() for p in pooled_list]
+    df["hidden_dim"] = hidden_dim
+
+    df.to_parquet(out_path, index=False)
+    _log(f"{species_id}: written to {out_path}")
+    return hidden_dim
+
+
+def run_generate_embeddings(args) -> None:
+    chunks_dir = args.chunks_dir.resolve()
+    outdir = args.outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    logs_dir = outdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _open_log(logs_dir, "generate_embeddings")
+
+    _validate_inputs([("--chunks_dir", chunks_dir)])
+
+    chunk_files = sorted(chunks_dir.glob("*.parquet"))
+    if not chunk_files:
+        print(f"ERROR: no Parquet files found in {chunks_dir}", file=sys.stderr)
+        sys.exit(1)
+    _log(f"Found {len(chunk_files)} species to embed: {[f.stem for f in chunk_files]}")
+
+    if args.dry_run:
+        _banner("Dry run — no steps will be executed")
+        _log(f"  chunks_dir : {chunks_dir}/")
+        _log(f"  outdir     : {outdir}/")
+        _log(f"  model      : {args.model}")
+        _log(f"  bin_size   : {args.bin_size}")
+        _log(f"  batch_size : {args.batch_size}")
+        _log(f"  force      : {args.force}")
+        _log(f"  Species that would be embedded: {[f.stem for f in chunk_files]}")
+        _log("  Exiting (--dry_run).")
+        sys.exit(0)
+
+    if args.force:
+        _log("--force set: all species will be reprocessed regardless of "
+             "existing outputs")
+    elif outdir.exists() and any(outdir.iterdir()):
+        _log("Existing outdir found — resuming from checkpoints "
+             "(use --force to rerun all species from scratch)")
+
+    import torch
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    _log(f"Using device: {device}")
+
+    tokenizer, model = load_hyena_model(args.model, device)
+
+    t_start = time.monotonic()
+    tracker = _start_tracker("ShoggoTEh_generate_embeddings", logs_dir, args.disable_co2_tracking)
+
+    n_species_processed = 0
+    hidden_dim = None
+    for chunk_path in chunk_files:
+        try:
+            dim = process_species_embed(
+                chunks_path=chunk_path, outdir=outdir,
+                tokenizer=tokenizer, model=model, device=device,
+                bin_size=args.bin_size, batch_size=args.batch_size,
+                force=args.force,
+            )
+            if dim:
+                n_species_processed += 1
+                hidden_dim = dim
+        except Exception as exc:
+            _log(f"  ERROR {chunk_path.stem}: FAILED — {exc}")
+            continue
+
+    emissions_kg = _stop_tracker(tracker)
+    elapsed_s   = time.monotonic() - t_start
+    peak_mem_mb = _peak_mem_mb()
+    _log(f"Wall-clock time   : {elapsed_s:.1f} s ({elapsed_s/60:.1f} min)")
+    _log(f"Peak memory (RSS) : {peak_mem_mb:.1f} MB")
+
+    summary = {
+        "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": VERSION,
+        "input_chunks_dir":    str(chunks_dir),
+        "n_species_processed": n_species_processed,
+        "hidden_dim":          hidden_dim,
+        "parameters": {
+            "model":      args.model,
+            "bin_size":   args.bin_size,
+            "batch_size": args.batch_size,
+            "device":     str(device),
+        },
+        "resource_usage": {
+            "wall_clock_s":       round(elapsed_s, 1),
+            "peak_mem_mb":        round(peak_mem_mb, 1),
+            "emissions_kg_CO2eq": emissions_kg,
+        },
+    }
+    _write_summary(outdir, summary)
+    _close_log()
+
+
+###############################################################################
+# train_classifier — dense CNN + linear-chain CRF
+###############################################################################
+
+def _build_dense_model_classes():
+    """Import torch lazily and define the model + CRF classes. Returns
+    (torch, nn, DenseTEClassifier, LinearChainCRF)."""
+    import torch
+    import torch.nn as nn
+
+    class DenseTEClassifier(nn.Module):
+        """Light 1D-CNN local-context smoothing + linear per-bin head on
+        top of frozen per-bin Hyena-DNA embeddings."""
+
+        def __init__(self, input_dim: int, cnn_channels: int, kernel_size: int,
+                    n_classes: int, dropout: float):
+            super().__init__()
+            self.conv = nn.Conv1d(input_dim, cnn_channels, kernel_size,
+                                  padding=kernel_size // 2)
+            self.act = nn.ReLU()
+            self.dropout = nn.Dropout(dropout)
+            self.classifier = nn.Linear(cnn_channels, n_classes)
+
+        def forward(self, x):
+            # x: (B, n_bins, input_dim)
+            x = x.transpose(1, 2)              # (B, input_dim, n_bins)
+            x = self.act(self.conv(x))
+            x = self.dropout(x)
+            x = x.transpose(1, 2)              # (B, n_bins, cnn_channels)
+            return self.classifier(x)          # (B, n_bins, n_classes) — emissions
+
+    class LinearChainCRF(nn.Module):
+        """Linear-chain CRF implemented from scratch (transition matrix +
+        forward algorithm for the partition function + Viterbi decode).
+        Avoids adding a new pip dependency (e.g. pytorch-crf) since
+        envs/shoggoTEh.yaml deliberately keeps a minimal dependency set."""
+
+        def __init__(self, n_classes: int):
+            super().__init__()
+            self.n_classes = n_classes
+            self.transitions       = nn.Parameter(torch.randn(n_classes, n_classes) * 0.01)
+            self.start_transitions = nn.Parameter(torch.randn(n_classes) * 0.01)
+            self.end_transitions   = nn.Parameter(torch.randn(n_classes) * 0.01)
+
+        def _score(self, emissions, tags):
+            B, T, _ = emissions.shape
+            idx = torch.arange(B, device=emissions.device)
+            score = self.start_transitions[tags[:, 0]] + emissions[idx, 0, tags[:, 0]]
+            for t in range(1, T):
+                score = (score + self.transitions[tags[:, t - 1], tags[:, t]]
+                         + emissions[idx, t, tags[:, t]])
+            score = score + self.end_transitions[tags[:, -1]]
+            return score
+
+        def _forward_alg(self, emissions):
+            B, T, _ = emissions.shape
+            alpha = self.start_transitions.unsqueeze(0) + emissions[:, 0]
+            for t in range(1, T):
+                broadcast = (alpha.unsqueeze(2) + self.transitions.unsqueeze(0)
+                            + emissions[:, t].unsqueeze(1))
+                alpha = torch.logsumexp(broadcast, dim=1)
+            alpha = alpha + self.end_transitions.unsqueeze(0)
+            return torch.logsumexp(alpha, dim=1)
+
+        def neg_log_likelihood(self, emissions, tags, sample_weights=None):
+            """sample_weights (optional, shape (B,)): per-sequence NLL
+            reweighting used to port --class_weight balanced from
+            per-window to per-bin frequency (mean weight of the gold bin
+            tags in that sequence)."""
+            gold = self._score(emissions, tags)
+            logZ = self._forward_alg(emissions)
+            nll = logZ - gold
+            if sample_weights is not None:
+                nll = nll * sample_weights
+            return nll.mean()
+
+        def decode(self, emissions):
+            """Viterbi decode. Returns a list (len B) of lists (len T) of
+            predicted class indices."""
+            B, T, _ = emissions.shape
+            backpointers = []
+            score = self.start_transitions.unsqueeze(0) + emissions[:, 0]
+            for t in range(1, T):
+                broadcast = score.unsqueeze(2) + self.transitions.unsqueeze(0)
+                best_score, best_idx = broadcast.max(dim=1)
+                score = best_score + emissions[:, t]
+                backpointers.append(best_idx)
+            score = score + self.end_transitions.unsqueeze(0)
+            _, best_final_tag = score.max(dim=1)
+            best_paths = []
+            for b in range(B):
+                tag = int(best_final_tag[b])
+                path = [tag]
+                for bp in reversed(backpointers):
+                    tag = int(bp[b, tag])
+                    path.append(tag)
+                path.reverse()
+                best_paths.append(path)
+            return best_paths
+
+    return torch, nn, DenseTEClassifier, LinearChainCRF
+
+
+def load_dense_embeddings(embeddings_dir: Path, labels: list) -> tuple:
+    parquet_files = sorted(embeddings_dir.glob("*.parquet"))
+    if not parquet_files:
+        print(f"ERROR: no Parquet files found in {embeddings_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    _log(f"Loading embeddings from {len(parquet_files)} species: "
+         f"{[f.stem for f in parquet_files]}")
+    df = pd.concat([pd.read_parquet(p) for p in parquet_files], ignore_index=True)
+    _log(f"Total chunks loaded: {len(df):,}")
+
+    n_bins_vals    = df["n_bins"].unique()
+    hidden_dim_vals = df["hidden_dim"].unique()
+    if len(n_bins_vals) > 1:
+        print(f"ERROR: inconsistent n_bins across the embeddings corpus: "
+              f"{n_bins_vals}. Regenerate all species with the same "
+              f"--chunk_size/--bin_size.", file=sys.stderr)
+        sys.exit(1)
+    if len(hidden_dim_vals) > 1:
+        print(f"ERROR: inconsistent hidden_dim across the embeddings corpus: "
+              f"{hidden_dim_vals}. Regenerate all species with the same "
+              f"--model.", file=sys.stderr)
+        sys.exit(1)
+    n_bins     = int(n_bins_vals[0])
+    hidden_dim = int(hidden_dim_vals[0])
+
+    label_to_idx = {lbl: i for i, lbl in enumerate(labels)}
+
+    def _encode(bl):
+        return [label_to_idx.get(l, -1) for l in bl]
+
+    bin_idx = df["bin_labels"].apply(_encode)
+    valid_mask = bin_idx.apply(lambda idxs: all(i >= 0 for i in idxs))
+    n_dropped = int((~valid_mask).sum())
+    if n_dropped:
+        _log(f"Dropped {n_dropped:,} chunks containing a bin label outside "
+             f"the configured --labels set")
+    df = df[valid_mask].reset_index(drop=True)
+    bin_idx = bin_idx[valid_mask].reset_index(drop=True)
+
+    all_bins = [l for row in df["bin_labels"] for l in row]
+    _log(f"Bin label distribution:\n{pd.Series(all_bins).value_counts().to_string()}")
+
+    X = np.stack([
+        np.asarray(e, dtype=np.float32).reshape(n_bins, hidden_dim)
+        for e in df["embedding_flat"]
+    ])
+    y = np.stack([np.asarray(idxs, dtype=np.int64) for idxs in bin_idx])
+
+    return X, y, n_bins, hidden_dim
+
+
+def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
+                epochs: int, lr: float, patience: int, outdir: Path,
+                class_weights) -> list:
+    optimizer = torch.optim.Adam(list(model.parameters()) + list(crf.parameters()), lr=lr)
+
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+    metrics = []
+
+    for epoch in range(1, epochs + 1):
+        model.train(); crf.train()
+        train_loss, train_total, train_correct, train_bins = 0.0, 0, 0, 0
+        for Xb, yb in train_loader:
+            Xb, yb = Xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            emissions = model(Xb)
+            sw = class_weights[yb].mean(dim=1) if class_weights is not None else None
+            loss = crf.neg_log_likelihood(emissions, yb, sw)
+            loss.backward()
+            optimizer.step()
+            train_loss  += loss.item() * len(yb)
+            train_total += len(yb)
+            with torch.no_grad():
+                preds = torch.tensor(crf.decode(emissions), device=device)
+                train_correct += (preds == yb).sum().item()
+                train_bins    += yb.numel()
+
+        model.eval(); crf.eval()
+        val_loss, val_total, val_correct, val_bins = 0.0, 0, 0, 0
+        with torch.no_grad():
+            for Xb, yb in val_loader:
+                Xb, yb = Xb.to(device), yb.to(device)
+                emissions = model(Xb)
+                sw = class_weights[yb].mean(dim=1) if class_weights is not None else None
+                loss = crf.neg_log_likelihood(emissions, yb, sw)
+                val_loss  += loss.item() * len(yb)
+                val_total += len(yb)
+                preds = torch.tensor(crf.decode(emissions), device=device)
+                val_correct += (preds == yb).sum().item()
+                val_bins    += yb.numel()
+
+        t_loss = train_loss / train_total
+        v_loss = val_loss / val_total
+        t_acc  = train_correct / train_bins
+        v_acc  = val_correct / val_bins
+
+        metrics.append({
+            "epoch": epoch, "train_loss": round(t_loss, 6), "val_loss": round(v_loss, 6),
+            "train_bin_acc": round(t_acc, 4), "val_bin_acc": round(v_acc, 4),
+        })
+        _log(f"Epoch {epoch:3d}/{epochs} | train loss {t_loss:.4f} bin-acc {t_acc:.3f} "
+             f"| val loss {v_loss:.4f} bin-acc {v_acc:.3f}")
+
+        if v_loss < best_val_loss:
+            best_val_loss = v_loss
+            epochs_no_improve = 0
+            torch.save({"model": model.state_dict(), "crf": crf.state_dict()},
+                      outdir / "classifier.pt")
+            _log(f"  -> best model saved (val_loss={v_loss:.4f})")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                _log(f"Early stopping after {epoch} epochs (no improvement for {patience})")
+                break
+
+    return metrics
+
+
+def run_train_classifier(args) -> None:
+    outdir = args.outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    logs_dir = outdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _open_log(logs_dir, "train_classifier")
+
+    embeddings_dir = args.embeddings_dir.resolve()
+    _validate_inputs([("--embeddings_dir", embeddings_dir)])
+
+    if args.dry_run:
+        _banner("Dry run — no steps will be executed")
+        _log(f"  embeddings_dir : {embeddings_dir}/")
+        _log(f"  outdir         : {outdir}/")
+        _log(f"  epochs         : {args.epochs}")
+        _log(f"  batch_size     : {args.batch_size}")
+        _log(f"  lr             : {args.lr}")
+        _log(f"  cnn_channels   : {args.cnn_channels}")
+        _log(f"  kernel_size    : {args.kernel_size}")
+        _log(f"  dropout        : {args.dropout}")
+        _log(f"  val_fraction   : {args.val_fraction}")
+        _log(f"  patience       : {args.patience}")
+        _log(f"  class_weight   : {args.class_weight}")
+        _log(f"  labels         : {args.labels}")
+        _log("  Steps that would run: load per-bin embeddings -> train "
+             "CNN+CRF sequence labeler -> evaluate -> save model")
+        _log("  Exiting (--dry_run).")
+        sys.exit(0)
+
+    import torch
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    _log(f"Using device: {device}")
+
+    X, y, n_bins, hidden_dim = load_dense_embeddings(embeddings_dir, args.labels)
+    _log(f"Loaded {X.shape[0]:,} chunks | n_bins={n_bins} | hidden_dim={hidden_dim}")
+
+    # Stratify the chunk-level split by each chunk's dominant bin label
+    # (a per-chunk proxy — the classifier itself trains at bin resolution).
+    strat_key = [Counter(row).most_common(1)[0][0] for row in y]
+    idx_train, idx_val = train_test_split(
+        np.arange(len(X)), test_size=args.val_fraction,
+        stratify=strat_key, random_state=args.seed,
+    )
+    X_train, X_val = X[idx_train], X[idx_val]
+    y_train, y_val = y[idx_train], y[idx_val]
+    _log(f"Train: {len(X_train):,} chunks | Val: {len(X_val):,} chunks")
+
+    torch_mod, nn, DenseTEClassifier, LinearChainCRF = _build_dense_model_classes()
+
+    class_weights = None
+    if args.class_weight == "balanced":
+        y_train_flat = y_train.reshape(-1)
+        present_classes = np.unique(y_train_flat)
+        w_present = compute_class_weight(class_weight="balanced",
+                                         classes=present_classes, y=y_train_flat)
+        full_weights = np.ones(len(args.labels), dtype=np.float32)
+        for cls_idx, w in zip(present_classes, w_present):
+            full_weights[cls_idx] = w
+        class_weights = torch.tensor(full_weights, dtype=torch.float32).to(device)
+        _log("Class weights (balanced, inverse per-bin training frequency):")
+        for lbl, w in zip(args.labels, full_weights):
+            _log(f"    {lbl:15s} weight={w:.4f}")
+    else:
+        _log("Class weighting disabled (--class_weight none)")
+
+    from torch.utils.data import DataLoader, TensorDataset
+    train_loader = DataLoader(
+        TensorDataset(torch.tensor(X_train, dtype=torch.float32),
+                     torch.tensor(y_train, dtype=torch.long)),
+        batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(
+        TensorDataset(torch.tensor(X_val, dtype=torch.float32),
+                     torch.tensor(y_val, dtype=torch.long)),
+        batch_size=args.batch_size, shuffle=False)
+
+    model = DenseTEClassifier(input_dim=hidden_dim, cnn_channels=args.cnn_channels,
+                              kernel_size=args.kernel_size, n_classes=len(args.labels),
+                              dropout=args.dropout).to(device)
+    crf = LinearChainCRF(n_classes=len(args.labels)).to(device)
+    _log(f"Model: Conv1d({hidden_dim}->{args.cnn_channels}, k={args.kernel_size}) -> "
+         f"ReLU -> Dropout({args.dropout}) -> Linear({args.cnn_channels}, "
+         f"{len(args.labels)}) -> LinearChainCRF")
+
+    label_encoder = {"label_to_idx": {lbl: i for i, lbl in enumerate(args.labels)},
+                     "idx_to_label": {str(i): lbl for i, lbl in enumerate(args.labels)}}
+    with open(outdir / "label_encoder.json", "w") as fh:
+        json.dump(label_encoder, fh, indent=2)
+
+    model_config = {
+        "input_dim": hidden_dim, "cnn_channels": args.cnn_channels,
+        "kernel_size": args.kernel_size, "n_classes": len(args.labels),
+        "dropout": args.dropout, "bin_size_trained_on": None,
+    }
+    with open(outdir / "model_config.json", "w") as fh:
+        json.dump(model_config, fh, indent=2)
+    _log(f"Label encoder + model config saved to {outdir}")
+
+    t_start = time.monotonic()
+    tracker = _start_tracker("ShoggoTEh_train_classifier", logs_dir, args.disable_co2_tracking)
+
+    metrics = train_dense(torch_mod, nn, model, crf, train_loader, val_loader, device,
+                          args.epochs, args.lr, args.patience, outdir, class_weights)
+
+    emissions_kg = _stop_tracker(tracker)
+
+    metrics_path = outdir / "training_metrics.tsv"
+    pd.DataFrame(metrics).to_csv(metrics_path, sep="\t", index=False)
+    _log(f"Training metrics saved to {metrics_path}")
+
+    _log("Loading best model for final (bin-level) evaluation ...")
+    state = torch.load(outdir / "classifier.pt", map_location=device)
+    model.load_state_dict(state["model"])
+    crf.load_state_dict(state["crf"])
+    model.eval(); crf.eval()
+
+    all_preds, all_true = [], []
+    with torch.no_grad():
+        for Xb, yb in val_loader:
+            emissions = model(Xb.to(device))
+            preds = crf.decode(emissions)
+            all_preds.extend([p for seq in preds for p in seq])
+            all_true.extend(yb.reshape(-1).tolist())
+
+    report = classification_report(all_true, all_preds, labels=list(range(len(args.labels))),
+                                   target_names=args.labels, digits=3, zero_division=0)
+    _log(f"Validation bin-level classification report:\n{report}")
+    (outdir / "classification_report.txt").write_text(report)
+
+    if emissions_kg is not None:
+        _log(f"Carbon footprint: {emissions_kg:.6f} kg CO2 equivalent")
+
+    elapsed_s   = time.monotonic() - t_start
+    peak_mem_mb = _peak_mem_mb()
+    _log(f"Wall-clock time   : {elapsed_s:.1f} s ({elapsed_s/60:.1f} min)")
+    _log(f"Peak memory (RSS) : {peak_mem_mb:.1f} MB")
+
+    best_val_loss = min((m["val_loss"] for m in metrics), default=None)
+    summary = {
+        "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": VERSION,
+        "input_embeddings_dir": str(embeddings_dir),
+        "n_classes":    len(args.labels),
+        "n_bins":       n_bins,
+        "hidden_dim":   hidden_dim,
+        "n_train_chunks": len(X_train),
+        "n_val_chunks":    len(X_val),
+        "best_val_loss": best_val_loss,
+        "n_epochs_run":  len(metrics),
+        "parameters": {
+            "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
+            "cnn_channels": args.cnn_channels, "kernel_size": args.kernel_size,
+            "dropout": args.dropout, "val_fraction": args.val_fraction,
+            "patience": args.patience, "class_weight": args.class_weight,
+            "seed": args.seed,
+        },
+        "resource_usage": {
+            "wall_clock_s":       round(elapsed_s, 1),
+            "peak_mem_mb":        round(peak_mem_mb, 1),
+            "emissions_kg_CO2eq": emissions_kg,
+        },
+    }
+    _write_summary(outdir, summary)
+    _close_log()
+
+
+###############################################################################
+# predict — dense forward pass + CRF decode + run-length-encode to BED
+###############################################################################
+
+def load_classifier_dense(model_dir: Path, device):
+    encoder_path = model_dir / "label_encoder.json"
+    config_path  = model_dir / "model_config.json"
+    weights_path = model_dir / "classifier.pt"
+    for p, flag in ((encoder_path, "label_encoder.json"), (config_path, "model_config.json"),
+                    (weights_path, "classifier.pt")):
+        if not p.exists():
+            print(f"ERROR: {flag} not found in {model_dir}", file=sys.stderr)
+            sys.exit(1)
+
+    with open(encoder_path) as fh:
+        enc = json.load(fh)
+    labels = [enc["idx_to_label"][str(i)] for i in range(len(enc["idx_to_label"]))]
+
+    with open(config_path) as fh:
+        cfg = json.load(fh)
+
+    _, _, DenseTEClassifier, LinearChainCRF = _build_dense_model_classes()
+    model = DenseTEClassifier(input_dim=cfg["input_dim"], cnn_channels=cfg["cnn_channels"],
+                              kernel_size=cfg["kernel_size"], n_classes=cfg["n_classes"],
+                              dropout=0.0)
+    crf = LinearChainCRF(n_classes=cfg["n_classes"])
+
+    import torch
+    state = torch.load(weights_path, map_location=device)
+    model.load_state_dict(state["model"])
+    crf.load_state_dict(state["crf"])
+    model.eval().to(device)
+    crf.eval().to(device)
+    _log(f"Classifier loaded: input_dim={cfg['input_dim']} cnn_channels={cfg['cnn_channels']} "
+         f"n_classes={cfg['n_classes']}")
+    _log(f"Labels: {labels}")
+    return model, crf, labels
+
+
+def rle_encode_bins(bin_records: list) -> list:
+    """Run-length-encode a stream of per-bin predictions (sorted by chrom,
+    start) into merged BED intervals. Breaks the run on chrom change, label
+    change, or a coordinate discontinuity (non-adjacent bins)."""
+    intervals = []
+    cur = None
+    for rec in bin_records:
+        if (cur is not None and rec["chrom"] == cur["chrom"]
+                and rec["label"] == cur["label"] and rec["start"] == cur["end"]):
+            cur["end"] = rec["end"]
+            cur["probs"].append(rec["prob"])
+        else:
+            if cur is not None:
+                intervals.append(cur)
+            cur = {"chrom": rec["chrom"], "start": rec["start"], "end": rec["end"],
+                  "label": rec["label"], "probs": [rec["prob"]]}
+    if cur is not None:
+        intervals.append(cur)
+    for iv in intervals:
+        iv["confidence"] = sum(iv["probs"]) / len(iv["probs"])
+        del iv["probs"]
+    return intervals
+
+
+def write_bed_intervals(intervals: list, bed_path: Path) -> None:
+    intervals = sorted(intervals, key=lambda iv: (iv["chrom"], iv["start"]))
+    with open(bed_path, "w") as fh:
+        for iv in intervals:
+            fh.write(f"{iv['chrom']}\t{iv['start']}\t{iv['end']}\t{iv['label']}\t"
+                     f"{iv['confidence']:.4f}\t.\n")
+    _log(f"BED written to {bed_path} ({len(intervals):,} merged intervals)")
+
+
+def write_bin_probs_tsv(bin_records: list, labels: list, tsv_path: Path) -> None:
+    bin_records = sorted(bin_records, key=lambda r: (r["chrom"], r["start"]))
+    header = ["chrom", "start", "end", "label", "confidence"] + labels
+    with open(tsv_path, "w") as fh:
+        fh.write("\t".join(header) + "\n")
+        for r in bin_records:
+            row = [r["chrom"], str(r["start"]), str(r["end"]), r["label"], f"{r['prob']:.4f}"]
+            row += [f"{p:.4f}" for p in r["probs_all"]]
+            fh.write("\t".join(row) + "\n")
+    _log(f"Per-bin probability TSV written to {tsv_path}")
+
+
+def run_predict(args) -> None:
+    fasta_path = args.fasta.resolve()
+    model_dir  = args.model_dir.resolve()
+    outdir     = args.outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    logs_dir = outdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _open_log(logs_dir, "predict")
+
+    _validate_inputs([("--fasta", fasta_path), ("--model_dir", model_dir)])
+
+    if args.chunk_size % args.bin_size != 0:
+        print(f"ERROR: --chunk_size ({args.chunk_size}) must be a multiple of "
+              f"--bin_size ({args.bin_size})", file=sys.stderr)
+        sys.exit(1)
+
+    prefix = args.prefix or fasta_path.stem
+
+    if args.dry_run:
+        _banner("Dry run — no steps will be executed")
+        _log(f"  fasta          : {fasta_path}")
+        _log(f"  model_dir      : {model_dir}/")
+        _log(f"  outdir         : {outdir}/")
+        _log(f"  prefix         : {prefix}")
+        _log(f"  hyena_model    : {args.hyena_model}")
+        _log(f"  chunk_size     : {args.chunk_size}")
+        _log(f"  bin_size       : {args.bin_size}")
+        _log(f"  overlap        : {args.overlap}")
+        _log(f"  max_n_fraction : {args.max_n_fraction}")
+        _log(f"  batch_size     : {args.batch_size}")
+        _log("  Steps that would run: slide windows -> dense embed -> "
+             "CNN+CRF forward + Viterbi decode -> run-length-encode -> BED")
+        _log("  Exiting (--dry_run).")
+        sys.exit(0)
+
+    import torch
+    import torch.nn.functional as F
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    _log(f"Using device: {device}")
+
+    tokenizer, hyena_model = load_hyena_model(args.hyena_model, device)
+    model, crf, labels = load_classifier_dense(model_dir, device)
+
+    t_start = time.monotonic()
+    tracker = _start_tracker("ShoggoTEh_predict", logs_dir, args.disable_co2_tracking)
+
+    _log(f"Loading genome: {fasta_path}")
+    fasta  = Fasta(str(fasta_path))
+    stride = int(args.chunk_size * (1 - args.overlap)) if args.overlap < 1.0 else args.chunk_size
+    all_windows = make_windows(fasta, args.chunk_size, stride)
+    n_windows_total = len(all_windows)
+    _log(f"{n_windows_total:,} windows generated (chunk={args.chunk_size}, stride={stride})")
+
+    n_bins = args.chunk_size // args.bin_size
+    sequences, kept_windows = [], []
+    skipped_n = 0
+    for chrom, start, end in all_windows:
+        seq = str(fasta[chrom][start:end]).upper()
+        if seq.count("N") / len(seq) > args.max_n_fraction:
+            skipped_n += 1
+            continue
+        sequences.append(seq)
+        kept_windows.append((chrom, start, end))
+
+    n_windows_kept = len(kept_windows)
+    _log(f"{n_windows_kept:,} windows kept | {skipped_n:,} skipped (N content)")
+    if not kept_windows:
+        print("ERROR: no windows passed the N-content filter. Check your FASTA.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    _log("Generating dense per-bin embeddings ...")
+    pooled_list = embed_sequences_dense(sequences, n_bins, args.bin_size,
+                                        tokenizer, hyena_model, device, args.batch_size)
+
+    _log("Running CNN + CRF forward pass and Viterbi decode ...")
+    bin_records = []
+    with torch.no_grad():
+        for b_start in range(0, len(pooled_list), args.batch_size):
+            batch_pooled = pooled_list[b_start: b_start + args.batch_size]
+            batch_windows = kept_windows[b_start: b_start + args.batch_size]
+            Xb = torch.tensor(np.stack(batch_pooled), dtype=torch.float32).to(device)
+            emissions = model(Xb)
+            probs = F.softmax(emissions, dim=2).cpu().numpy()   # (B, n_bins, C)
+            decoded = crf.decode(emissions)                     # list[list[int]]
+
+            for (chrom, start, end), path, prob_row in zip(batch_windows, decoded, probs):
+                for i in range(n_bins):
+                    bstart = start + i * args.bin_size
+                    bend   = bstart + args.bin_size
+                    cls_idx = path[i]
+                    bin_records.append({
+                        "chrom": chrom, "start": bstart, "end": bend,
+                        "label": labels[cls_idx], "prob": float(prob_row[i, cls_idx]),
+                        "probs_all": prob_row[i].tolist(),
+                    })
+
+    bin_records.sort(key=lambda r: (r["chrom"], r["start"]))
+    dist = Counter(r["label"] for r in bin_records)
+    _log("Prediction distribution (per-bin): " +
+         " | ".join(f"{k}: {v:,}" for k, v in sorted(dist.items())))
+
+    intervals = rle_encode_bins(bin_records)
+    write_bed_intervals(intervals, outdir / f"{prefix}.bed")
+    write_bin_probs_tsv(bin_records, labels, outdir / f"{prefix}_bin_probs.tsv")
+
+    emissions_kg = _stop_tracker(tracker)
+    if emissions_kg is not None:
+        _log(f"Carbon footprint: {emissions_kg:.6f} kg CO2 equivalent")
+
+    elapsed_s   = time.monotonic() - t_start
+    peak_mem_mb = _peak_mem_mb()
+    _log(f"Wall-clock time   : {elapsed_s:.1f} s ({elapsed_s/60:.1f} min)")
+    _log(f"Peak memory (RSS) : {peak_mem_mb:.1f} MB")
+
+    summary = {
+        "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": VERSION,
+        "input_fasta":     str(fasta_path),
+        "n_windows_total": n_windows_total,
+        "n_windows_kept":  n_windows_kept,
+        "n_skipped_n":     skipped_n,
+        "n_bed_intervals": len(intervals),
+        "parameters": {
+            "hyena_model": args.hyena_model, "chunk_size": args.chunk_size,
+            "bin_size": args.bin_size, "overlap": args.overlap,
+            "max_n_fraction": args.max_n_fraction, "batch_size": args.batch_size,
+            "device": str(device),
+        },
+        "resource_usage": {
+            "wall_clock_s":       round(elapsed_s, 1),
+            "peak_mem_mb":        round(peak_mem_mb, 1),
+            "emissions_kg_CO2eq": emissions_kg,
+        },
+    }
+    _write_summary(outdir, summary)
+    _close_log()
+
+
+###############################################################################
+# compare_te_annotation — unchanged logic, moved into the merged CLI
+###############################################################################
+
+def load_target(bed_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(
+        bed_path, sep="\t", header=None,
+        names=["chrom", "start", "end", "label", "confidence", "strand"],
+        dtype={"chrom": str, "start": int, "end": int, "label": str, "confidence": float},
+    )
+    _log(f"Target: {len(df):,} intervals loaded from {bed_path}")
+    _log(f"Target label distribution:\n{df['label'].value_counts().to_string()}")
+    return df
+
+
+def load_reference_repeats(bed_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(
+        bed_path, sep="\t", header=None, usecols=[0, 1, 2, 3],
+        names=["chrom", "start", "end", "classification"],
+        dtype={"chrom": str, "start": int, "end": int, "classification": str},
+    )
+    df["label"] = df["classification"].apply(map_repeat_class)
+    _log(f"Reference: {len(df):,} intervals loaded from {bed_path}")
+    _log(f"Reference label distribution:\n{df['label'].value_counts().to_string()}")
+    return df[["chrom", "start", "end", "label"]]
+
+
+def load_genes_for_compare(gff3_path: Path) -> pd.DataFrame:
+    gff = pd.read_csv(
+        gff3_path, sep="\t", comment="#", header=None,
+        names=["chrom", "source", "feature", "start", "end",
+               "score", "strand", "frame", "attributes"],
+        dtype={"chrom": str},
+    )
+    genes = gff[gff["feature"] == "gene"][["chrom", "start", "end"]].copy()
+    genes["start"] = genes["start"] - 1
+    _log(f"Gene models: {len(genes):,} gene intervals loaded from {gff3_path}")
+    return genes
+
+
+def assign_reference_labels(target_df: pd.DataFrame, repeats_df: pd.DataFrame,
+                            genes_df, min_fraction: float) -> list:
+    """Operates on arbitrary (non-fixed-size) target intervals — this is
+    why compare_te_annotation needs no changes for the dense architecture:
+    the merged BED intervals from predict's run-length-encoding are just
+    another set of arbitrary-length intervals."""
+    win_bed = pybedtools.BedTool.from_dataframe(target_df[["chrom", "start", "end"]])
+    rep_bed = pybedtools.BedTool.from_dataframe(repeats_df)
+
+    rep_intersect = win_bed.intersect(rep_bed, wao=True)
+    rep_overlaps: dict = {}
+    for feat in rep_intersect:
+        key = (feat.chrom, int(feat.start), int(feat.end))
+        rep_class = feat.fields[3]
+        bp = int(feat.fields[4])
+        if rep_class != "." and bp > 0:
+            rep_overlaps.setdefault(key, {})
+            rep_overlaps[key][rep_class] = rep_overlaps[key].get(rep_class, 0) + bp
+
+    gene_overlaps: dict = {}
+    if genes_df is not None:
+        gene_bed = pybedtools.BedTool.from_dataframe(genes_df)
+        gene_intersect = win_bed.intersect(gene_bed, wao=True)
+        for feat in gene_intersect:
+            key = (feat.chrom, int(feat.start), int(feat.end))
+            bp = int(feat.fields[-1])
+            if bp > 0:
+                gene_overlaps[key] = gene_overlaps.get(key, 0) + bp
+
+    results = []
+    for _, row in target_df.iterrows():
+        key = (row["chrom"], int(row["start"]), int(row["end"]))
+        win_size = int(row["end"]) - int(row["start"])
+        rep_ovlp = rep_overlaps.get(key, {})
+        total_rep_bp = sum(rep_ovlp.values())
+        rep_fraction = total_rep_bp / win_size if win_size else 0.0
+
+        if rep_fraction >= min_fraction:
+            dominant_class = max(rep_ovlp, key=rep_ovlp.get)
+            dominant_bp = rep_ovlp[dominant_class]
+            if dominant_bp / win_size >= min_fraction:
+                ref_label, overlap_bp, overlap_frac = dominant_class, dominant_bp, dominant_bp / win_size
+            else:
+                ref_label, overlap_bp, overlap_frac = "Ambiguous", total_rep_bp, rep_fraction
+        else:
+            gene_bp = gene_overlaps.get(key, 0)
+            gene_fraction = gene_bp / win_size if win_size else 0.0
+            overlap_bp, overlap_frac = 0, 0.0
+            if genes_df is not None and gene_fraction >= min_fraction:
+                ref_label = "Genic"
+            else:
+                ref_label = "Intergenic"
+
+        results.append({"ref_label": ref_label, "ref_overlap_bp": overlap_bp,
+                        "ref_overlap_fraction": round(overlap_frac, 4)})
+
+    pybedtools.cleanup()
+    return results
+
+
+def write_comparison(target_df: pd.DataFrame, ref_results: list, out_path: Path) -> None:
+    rows = []
+    for (_, trow), rrow in zip(target_df.iterrows(), ref_results):
+        rows.append({
+            "chrom": trow["chrom"], "start": trow["start"], "end": trow["end"],
+            "target_label": trow["label"], "target_confidence": round(trow["confidence"], 4),
+            "ref_label": rrow["ref_label"], "ref_overlap_bp": rrow["ref_overlap_bp"],
+            "ref_overlap_fraction": rrow["ref_overlap_fraction"],
+            "match": trow["label"] == rrow["ref_label"],
+        })
+    out_df = pd.DataFrame(rows).sort_values(["chrom", "start"])
+    out_df.to_csv(out_path, sep="\t", index=False)
+    _log(f"Per-interval comparison written to {out_path}")
+
+
+def write_compare_metrics(target_labels: list, ref_labels: list, n_ambiguous: int,
+                          used_gff3: bool, out_path: Path) -> float:
+    present_labels = sorted(set(target_labels) | set(ref_labels))
+    acc = accuracy_score(ref_labels, target_labels)
+    report = classification_report(ref_labels, target_labels, labels=present_labels,
+                                   target_names=present_labels, digits=4,
+                                   zero_division=0, output_dict=True)
+
+    rows = []
+    for label in present_labels:
+        m = report.get(label, {})
+        rows.append({"class": label, "precision": round(m.get("precision", 0), 4),
+                     "recall": round(m.get("recall", 0), 4),
+                     "f1_score": round(m.get("f1-score", 0), 4),
+                     "support": int(m.get("support", 0))})
+    for avg in ("macro avg", "weighted avg"):
+        m = report.get(avg, {})
+        rows.append({"class": avg, "precision": round(m.get("precision", 0), 4),
+                     "recall": round(m.get("recall", 0), 4),
+                     "f1_score": round(m.get("f1-score", 0), 4),
+                     "support": int(m.get("support", 0))})
+    rows.append({"class": "overall_accuracy", "precision": round(acc, 4),
+                 "recall": "", "f1_score": "", "support": len(target_labels)})
+    metrics_df = pd.DataFrame(rows)
+
+    cm = confusion_matrix(ref_labels, target_labels, labels=present_labels)
+    cm_df = pd.DataFrame(cm, index=present_labels, columns=present_labels)
+    cm_df.index.name = "ref \\ target"
+
+    with open(out_path, "w") as fh:
+        fh.write("# ShoggoTEh annotation comparison metrics\n")
+        fh.write(f"# Gene annotations used: {used_gff3}\n")
+        fh.write(f"# Intervals evaluated: {len(target_labels):,}\n")
+        fh.write(f"# Intervals excluded (ambiguous reference): {n_ambiguous:,}\n")
+        fh.write("#\n## Per-class and overall metrics\n")
+        fh.write(metrics_df.to_csv(sep="\t", index=False))
+        fh.write("\n## Confusion matrix (rows=reference, cols=target)\n")
+        fh.write(cm_df.to_csv(sep="\t"))
+
+    _log(f"Metrics written to {out_path}")
+    _log(f"Overall accuracy: {acc:.4f}")
+    return acc
+
+
+def run_compare_te_annotation(args) -> None:
+    target_path    = args.target.resolve()
+    reference_path = args.reference.resolve()
+    outdir = args.outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    prefix = args.prefix or target_path.stem
+    logs_dir = outdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _open_log(logs_dir, "compare_te_annotation")
+
+    _validate_inputs([("--target", target_path), ("--reference", reference_path)])
+    if args.gff3:
+        args.gff3 = args.gff3.resolve()
+        _validate_inputs([("--gff3", args.gff3)])
+
+    if args.dry_run:
+        _banner("Dry run — no steps will be executed")
+        _log(f"  target      : {target_path}")
+        _log(f"  reference   : {reference_path}")
+        _log(f"  gff3        : {args.gff3 or '(none)'}")
+        _log(f"  outdir      : {outdir}/")
+        _log(f"  prefix      : {prefix}")
+        _log(f"  min_fraction: {args.min_fraction}")
+        _log("  Steps that would run: load inputs -> intersect -> write "
+             "comparison TSV -> write metrics TSV")
+        _log("  Exiting (--dry_run).")
+        sys.exit(0)
+
+    t_start = time.monotonic()
+
+    target_df  = load_target(target_path)
+    repeats_df = load_reference_repeats(reference_path)
+    genes_df   = load_genes_for_compare(args.gff3) if args.gff3 else None
+    if genes_df is None:
+        _log("No GFF3 provided — non-repeat intervals will be labelled Intergenic")
+
+    _log("Intersecting target intervals with reference annotations ...")
+    ref_results = assign_reference_labels(target_df, repeats_df, genes_df, args.min_fraction)
+
+    write_comparison(target_df, ref_results, outdir / f"{prefix}_comparison.tsv")
+
+    target_labels, ref_labels = [], []
+    n_ambiguous = 0
+    for (_, trow), rrow in zip(target_df.iterrows(), ref_results):
+        if rrow["ref_label"] == "Ambiguous":
+            n_ambiguous += 1
+            continue
+        target_labels.append(trow["label"])
+        ref_labels.append(rrow["ref_label"])
+
+    n_evaluated = len(target_labels)
+    _log(f"Intervals evaluated: {n_evaluated:,} | excluded (ambiguous reference): {n_ambiguous:,}")
+
+    if not target_labels:
+        print("ERROR: no evaluable intervals — check that target and reference "
+              "share the same chromosome names and coordinate space.", file=sys.stderr)
+        sys.exit(1)
+
+    overall_accuracy = write_compare_metrics(
+        target_labels, ref_labels, n_ambiguous=n_ambiguous,
+        used_gff3=genes_df is not None, out_path=outdir / f"{prefix}_metrics.tsv")
+
+    elapsed_s   = time.monotonic() - t_start
+    peak_mem_mb = _peak_mem_mb()
+    _log(f"Wall-clock time   : {elapsed_s:.1f} s ({elapsed_s/60:.1f} min)")
+    _log(f"Peak memory (RSS) : {peak_mem_mb:.1f} MB")
+
+    summary = {
+        "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": VERSION,
+        "target":    str(target_path),
+        "reference": str(reference_path),
+        "n_intervals_evaluated": n_evaluated,
+        "n_ambiguous":           n_ambiguous,
+        "overall_accuracy":      round(overall_accuracy, 4) if overall_accuracy is not None else None,
+        "parameters": {"min_fraction": args.min_fraction, "gff3": str(args.gff3) if args.gff3 else None},
+        "resource_usage": {"wall_clock_s": round(elapsed_s, 1), "peak_mem_mb": round(peak_mem_mb, 1)},
+    }
+    _write_summary(outdir, summary)
+    _close_log()
+
+
+###############################################################################
+# Argument parser
+###############################################################################
+
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="ShoggoTEh",
+        description="Deep-learning TE annotation pipeline (Shoggoth + TEh) — "
+                    "dense per-bin sequence labeling with a CNN+CRF head "
+                    "over frozen Hyena-DNA embeddings.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = ap.add_subparsers(
+        dest="command",
+        metavar="{prepare_dataset,generate_embeddings,train_classifier,predict,compare_te_annotation}",
+        required=True,
+    )
+
+    # ── prepare_dataset ─────────────────────────────────────────────────────
+    pp = sub.add_parser("prepare_dataset",
+                        help="Slide windows, label every bin by the exact "
+                             "repeat/gene interval it falls in (dense)")
+    req = pp.add_argument_group("required")
+    req.add_argument("--species_tsv", required=True, type=Path, metavar="FILE",
+                     help="TSV: species_id, fasta, bed, gff3 (gff3 optional / NA)")
+    req.add_argument("--outdir", required=True, type=Path, metavar="DIR",
+                     help="Output directory for per-species Parquet files")
+    opt = pp.add_argument_group("optional")
+    opt.add_argument("--chunk_size", type=int, default=5000, metavar="BP",
+                     help="Window size in bp (default: 5000)")
+    opt.add_argument("--bin_size", type=int, default=50, metavar="BP",
+                     help="Per-bin label/embedding resolution in bp; must "
+                          "evenly divide --chunk_size (default: 50)")
+    opt.add_argument("--overlap", type=float, default=0.5, metavar="F",
+                     help="Fractional overlap between windows (default: 0.5)")
+    opt.add_argument("--max_n_fraction", type=float, default=0.1, metavar="F",
+                     help="Max N fraction allowed in a chunk (default: 0.1)")
+    opt.add_argument("--force", action="store_true",
+                     help="Rerun all species even if output Parquet already exists")
+    opt.add_argument("--dry_run", action="store_true",
+                     help="Validate inputs and print planned steps, then exit")
+    opt.add_argument("--disable_co2_tracking", action="store_true",
+                     help="Disable carbon footprint tracking")
+
+    # ── generate_embeddings ─────────────────────────────────────────────────
+    gp = sub.add_parser("generate_embeddings",
+                        help="Run chunks through Hyena-DNA and pool into "
+                             "per-bin embeddings")
+    req = gp.add_argument_group("required")
+    req.add_argument("--chunks_dir", required=True, type=Path, metavar="DIR",
+                     help="Directory with per-species Parquet files from prepare_dataset")
+    req.add_argument("--outdir", required=True, type=Path, metavar="DIR",
+                     help="Output directory for per-species embedding Parquet files")
+    opt = gp.add_argument_group("optional")
+    opt.add_argument("--model", default="LongSafari/hyenadna-medium-160k-seqlen-hf",
+                     metavar="NAME", help="Hyena-DNA model on HuggingFace Hub")
+    opt.add_argument("--bin_size", type=int, default=50, metavar="BP",
+                     help="Per-bin pooling resolution in bp; must match the "
+                          "chunks' bin_size (default: 50)")
+    opt.add_argument("--batch_size", type=int, default=32, metavar="N",
+                     help="Sequences per forward pass (default: 32)")
+    opt.add_argument("--device", default=None, metavar="DEV",
+                     help="'cuda', 'mps', or 'cpu'. Auto-detected if omitted.")
+    opt.add_argument("--force", action="store_true",
+                     help="Rerun all species even if output Parquet already exists")
+    opt.add_argument("--dry_run", action="store_true",
+                     help="Validate inputs and print planned steps, then exit")
+    opt.add_argument("--disable_co2_tracking", action="store_true",
+                     help="Disable carbon footprint tracking")
+
+    # ── train_classifier ─────────────────────────────────────────────────────
+    tp = sub.add_parser("train_classifier",
+                        help="Train a CNN + linear-chain CRF sequence "
+                             "labeler on per-bin embeddings")
+    req = tp.add_argument_group("required")
+    req.add_argument("--embeddings_dir", required=True, type=Path, metavar="DIR",
+                     help="Directory with per-species embedding Parquet files")
+    req.add_argument("--outdir", required=True, type=Path, metavar="DIR",
+                     help="Output directory for model weights, config, metrics")
+    opt = tp.add_argument_group("optional")
+    opt.add_argument("--labels", nargs="+", default=DEFAULT_LABELS, metavar="LBL",
+                     help=f"Ordered list of class labels (default: {DEFAULT_LABELS})")
+    opt.add_argument("--epochs", type=int, default=50, metavar="N",
+                     help="Maximum training epochs (default: 50)")
+    opt.add_argument("--batch_size", type=int, default=64, metavar="N",
+                     help="Mini-batch size in chunks/sequences (default: 64)")
+    opt.add_argument("--lr", type=float, default=1e-3, metavar="F",
+                     help="Adam learning rate (default: 0.001)")
+    opt.add_argument("--cnn_channels", type=int, default=128, metavar="N",
+                     help="1D-CNN channel width (default: 128)")
+    opt.add_argument("--kernel_size", type=int, default=5, metavar="N",
+                     help="1D-CNN kernel size in bins (default: 5)")
+    opt.add_argument("--dropout", type=float, default=0.3, metavar="F",
+                     help="Dropout probability (default: 0.3)")
+    opt.add_argument("--val_fraction", type=float, default=0.2, metavar="F",
+                     help="Fraction of chunks held out for validation (default: 0.2)")
+    opt.add_argument("--patience", type=int, default=10, metavar="N",
+                     help="Early-stopping patience in epochs (default: 10)")
+    opt.add_argument("--class_weight", choices=["balanced", "none"], default="balanced",
+                     help="'balanced' (default) weights the CRF's per-sequence "
+                          "NLL by inverse per-bin training-set class frequency "
+                          "(mean weight of the gold bin tags in that sequence), "
+                          "so rare TE classes are not drowned out. 'none' disables it.")
+    opt.add_argument("--seed", type=int, default=42, metavar="N",
+                     help="Random seed (default: 42)")
+    opt.add_argument("--device", default=None, metavar="DEV",
+                     help="'cuda', 'mps', or 'cpu'. Auto-detected if omitted.")
+    opt.add_argument("--dry_run", action="store_true",
+                     help="Validate inputs and print planned steps, then exit")
+    opt.add_argument("--disable_co2_tracking", action="store_true",
+                     help="Disable carbon footprint tracking")
+
+    # ── predict ───────────────────────────────────────────────────────────────
+    dp = sub.add_parser("predict",
+                        help="Dense CNN+CRF forward pass + Viterbi decode "
+                             "over a new genome, RLE-merged into BED intervals")
+    req = dp.add_argument_group("required")
+    req.add_argument("--fasta", required=True, type=Path, metavar="FASTA",
+                     help="Input genome FASTA (uncompressed or bgzipped)")
+    req.add_argument("--model_dir", required=True, type=Path, metavar="DIR",
+                     help="Directory with classifier.pt, label_encoder.json, model_config.json")
+    req.add_argument("--outdir", required=True, type=Path, metavar="DIR",
+                     help="Output directory for BED and per-bin probability TSV")
+    opt = dp.add_argument_group("optional")
+    opt.add_argument("--prefix", default=None, metavar="STR",
+                     help="Output filename prefix (default: FASTA filename stem)")
+    opt.add_argument("--hyena_model", default="LongSafari/hyenadna-medium-160k-seqlen-hf",
+                     metavar="NAME", help="Hyena-DNA model on HuggingFace Hub")
+    opt.add_argument("--chunk_size", type=int, default=5000, metavar="BP",
+                     help="Window size in bp (default: 5000)")
+    opt.add_argument("--bin_size", type=int, default=50, metavar="BP",
+                     help="Per-bin resolution in bp; must match the trained "
+                          "model's bin_size and evenly divide --chunk_size (default: 50)")
+    opt.add_argument("--overlap", type=float, default=0.0, metavar="F",
+                     help="Fractional overlap between windows (default: 0.0 — "
+                          "the dense architecture does not need the redundant "
+                          "50%% overlap the old window-level pipeline used)")
+    opt.add_argument("--max_n_fraction", type=float, default=0.1, metavar="F",
+                     help="Windows above this N fraction are skipped (default: 0.1)")
+    opt.add_argument("--batch_size", type=int, default=32, metavar="N",
+                     help="Embedding + forward-pass batch size (default: 32)")
+    opt.add_argument("--device", default=None, metavar="DEV",
+                     help="'cuda', 'mps', or 'cpu'. Auto-detected if omitted.")
+    opt.add_argument("--dry_run", action="store_true",
+                     help="Validate inputs and print planned steps, then exit")
+    opt.add_argument("--disable_co2_tracking", action="store_true",
+                     help="Disable carbon footprint tracking")
+
+    # ── compare_te_annotation ────────────────────────────────────────────────
+    cp = sub.add_parser("compare_te_annotation",
+                        help="Benchmark predictions against a reference BED annotation")
+    req = cp.add_argument_group("required")
+    req.add_argument("-t", "--target", required=True, type=Path, metavar="BED",
+                     help="Target BED file (ShoggoTEh predict output)")
+    req.add_argument("-r", "--reference", required=True, type=Path, metavar="BED",
+                     help="Reference BED file (e.g. EarlGrey filteredRepeats.bed)")
+    req.add_argument("--outdir", required=True, type=Path, metavar="DIR",
+                     help="Output directory")
+    opt = cp.add_argument_group("optional")
+    opt.add_argument("--gff3", default=None, type=Path, metavar="FILE",
+                     help="Gene annotation GFF3 for Genic/Intergenic resolution (optional)")
+    opt.add_argument("--prefix", default=None, metavar="STR",
+                     help="Output filename prefix (default: target BED stem)")
+    opt.add_argument("--min_fraction", type=float, default=0.5, metavar="F",
+                     help="Min overlap fraction to assign a reference label (default: 0.5)")
+    opt.add_argument("--dry_run", action="store_true",
+                     help="Validate inputs and print planned steps, then exit")
+
+    return ap
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    _print_quote()
+    ap = _build_parser()
+    args = ap.parse_args()
+
+    if args.command == "prepare_dataset":
+        run_prepare_dataset(args)
+    elif args.command == "generate_embeddings":
+        run_generate_embeddings(args)
+    elif args.command == "train_classifier":
+        run_train_classifier(args)
+    elif args.command == "predict":
+        run_predict(args)
+    elif args.command == "compare_te_annotation":
+        run_compare_te_annotation(args)
+
+
+if __name__ == "__main__":
+    main()

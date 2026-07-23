@@ -3,10 +3,10 @@
 make_test_data.py — Generate synthetic ShoggoTEh test data.
 
 Creates a small deterministic dataset (random.seed(42)) suitable for testing
-prepare_dataset.py without requiring any real genomes or large downloads.
-All Hyena-DNA / GPU steps (generate_embeddings.py, train_classifier.py,
-predict.py) still require the model weights and are not covered by this
-quick test.
+`ShoggoTEh.py prepare_dataset` without requiring any real genomes or large
+downloads. All Hyena-DNA / GPU subcommands (generate_embeddings,
+train_classifier, predict) still require the model weights and are not
+covered by this quick test.
 
 Output (written next to this script in test/):
     genomes/test_species.fa         3 chromosomes, ~75 kb total
@@ -140,4 +140,4 @@ with open(tsv_path, "w") as fh:
         f"{(HERE / 'gff3' / 'test_species.gff3').resolve()}\n"
     )
 print(f"  species → {tsv_path}")
-print("\nDone. Run 'python scripts/prepare_dataset.py --species_tsv test/species.tsv --outdir test/chunks/' to test.")
+print("\nDone. Run 'python scripts/ShoggoTEh.py prepare_dataset --species_tsv test/species.tsv --outdir test/chunks/' to test.")

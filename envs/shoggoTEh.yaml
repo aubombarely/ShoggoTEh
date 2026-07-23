@@ -10,10 +10,16 @@ dependencies:
   - pyarrow
   - pyfaidx
   - pybedtools
+  - bedtools
   - scikit-learn
+  - matplotlib
   - pip
   - pip:
-      - torch>=2.0
+      # Pinned to the known-good version manually installed on Salvia
+      # (production server) -- previously unpinned (torch>=2.0), which
+      # caused resolver drift in production. Bump deliberately, not via
+      # a floor constraint.
+      - torch==2.5.1
       - transformers>=4.36
       - accelerate
       - einops

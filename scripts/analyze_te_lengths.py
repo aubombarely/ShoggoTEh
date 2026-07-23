@@ -2,9 +2,9 @@
 """
 analyze_te_lengths.py  —  ShoggoTEh diagnostic: TE length distribution per class
 
-Reads the same species_tsv used by prepare_dataset.py, pools every BED
-interval across all listed species, maps each to its broad repeat class
-(reusing prepare_dataset.py's own REPEAT_CLASS_MAP so this stays consistent
+Reads the same species_tsv used by `ShoggoTEh.py prepare_dataset`, pools
+every BED interval across all listed species, maps each to its broad repeat
+class (reusing ShoggoTEh.py's own REPEAT_CLASS_MAP so this stays consistent
 with the actual labeling pipeline), and reports the real length distribution
 per class -- plus a data-driven suggested window size per class, based on
 the geometric rule that a window must be < 2x an element's length for that
@@ -27,10 +27,10 @@ import numpy as np
 import pandas as pd
 
 # Reuse the exact same class mapping as the main pipeline, so window-size
-# decisions are made against the same classes prepare_dataset.py will
-# actually assign.
+# decisions are made against the same classes ShoggoTEh.py prepare_dataset
+# will actually assign.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from prepare_dataset import REPEAT_CLASS_MAP, map_repeat_class  # noqa: E402
+from ShoggoTEh import REPEAT_CLASS_MAP, map_repeat_class  # noqa: E402
 
 VERSION = "v0.1.0"
 
@@ -144,7 +144,7 @@ def main() -> None:
         description="Analyze TE length distributions per class to inform window-size choices"
     )
     ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    ap.add_argument("--species_tsv", required=True, help="Same species TSV used by prepare_dataset.py")
+    ap.add_argument("--species_tsv", required=True, help="Same species TSV used by 'ShoggoTEh.py prepare_dataset'")
     ap.add_argument("--outdir", required=True, help="Output directory for summary TSV and plot")
     ap.add_argument("--format", default="pdf", help="Plot format(s), comma-separated (default: pdf)")
     ap.add_argument("--no_plot", action="store_true", help="Skip plotting, TSV summary only")
