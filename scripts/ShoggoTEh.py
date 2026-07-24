@@ -664,7 +664,13 @@ def process_species_embed(chunks_path: Path, outdir: Path, tokenizer, model,
     _log(f"{species_id}: hidden dim = {hidden_dim}")
 
     df = df.drop(columns=["sequence"])
-    df["embedding_flat"] = [p.flatten().tolist() for p in pooled_list]
+    # Store as raw float32 bytes rather than Python float lists -- .tolist()
+    # boxes every value into an individual Python float object (~28 bytes
+    # each), which at genome scale (hundreds of millions of bin embeddings)
+    # inflates RAM usage far beyond the raw array size and can OOM-kill the
+    # process during DataFrame construction. Raw bytes carry none of that
+    # per-element overhead.
+    df["embedding_bytes"] = [p.astype(np.float32).tobytes() for p in pooled_list]
     df["hidden_dim"] = hidden_dim
 
     df.to_parquet(out_path, index=False)
@@ -915,8 +921,8 @@ def load_dense_embeddings(embeddings_dir: Path, labels: list) -> tuple:
     _log(f"Bin label distribution:\n{pd.Series(all_bins).value_counts().to_string()}")
 
     X = np.stack([
-        np.asarray(e, dtype=np.float32).reshape(n_bins, hidden_dim)
-        for e in df["embedding_flat"]
+        np.frombuffer(e, dtype=np.float32).reshape(n_bins, hidden_dim)
+        for e in df["embedding_bytes"]
     ])
     y = np.stack([np.asarray(idxs, dtype=np.int64) for idxs in bin_idx])
 

@@ -143,7 +143,7 @@ python3 scripts/ShoggoTEh.py generate_embeddings \
 
 Hyena-DNA tokenizes at single-nucleotide resolution, so its per-token hidden states are already base-pair resolution — no interpolation needed. Instead of mean-pooling an entire window into one vector, hidden states are reshaped and averaged within each bin, producing a `[n_bins, hidden_dim]` embedding per chunk. The tokenizer's trailing EOS/SEP token is dropped before pooling so bin boundaries map correctly back to genomic coordinates. The Hyena-DNA backbone stays frozen.
 
-Output: one Parquet file per species under `data/embeddings/` with columns `species`, `chrom`, `start`, `end`, `bin_labels`, `n_bins`, `bin_size`, `repeat_fraction`, `embedding_flat` (flattened `[n_bins x hidden_dim]` list), `hidden_dim`. The `sequence` column is dropped to save space; it remains in the chunks Parquet.
+Output: one Parquet file per species under `data/embeddings/` with columns `species`, `chrom`, `start`, `end`, `bin_labels`, `n_bins`, `bin_size`, `repeat_fraction`, `embedding_bytes` (raw `float32` bytes of the `[n_bins x hidden_dim]` array, decoded via `np.frombuffer`), `hidden_dim`. The `sequence` column is dropped to save space; it remains in the chunks Parquet. Embeddings are stored as raw bytes rather than nested Python float lists — at genome scale, `.tolist()`-style boxing inflates RAM far beyond the raw array size and can OOM the process during DataFrame construction.
 
 ### 4. Train classifier (1D-CNN + linear-chain CRF)
 
