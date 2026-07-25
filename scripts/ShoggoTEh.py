@@ -52,7 +52,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.3.1"
+VERSION = "v0.3.2"
 
 import argparse
 import getpass
@@ -951,7 +951,7 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
 
     for epoch in range(1, epochs + 1):
         model.train(); crf.train()
-        train_loss, train_total, train_correct, train_bins = 0.0, 0, 0, 0
+        train_loss, train_total = 0.0, 0
         for Xb, yb in train_loader:
             Xb, yb = Xb.to(device), yb.to(device)
             optimizer.zero_grad()
@@ -962,21 +962,22 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
             optimizer.step()
             train_loss  += loss.item() * len(yb)
             train_total += len(yb)
-            with torch.no_grad():
-                # Cheap proxy for training-time monitoring: per-position
-                # argmax of the emission scores, ignoring the CRF's
-                # transition structure. Stays entirely on-GPU with no
-                # Python-level looping, unlike a full CRF Viterbi decode --
-                # which was previously called on every training batch
-                # purely to display this metric, and dominated wall-clock
-                # time (tens of thousands of synchronous GPU->CPU round
-                # trips per epoch). Validation below still uses the real
-                # CRF-decoded accuracy, since decode() is only paid once per
-                # validation batch per epoch, not once per training batch,
-                # and decode() itself is now vectorized.
-                preds = emissions.argmax(dim=-1)
-                train_correct += (preds == yb).sum().item()
-                train_bins    += yb.numel()
+            # No training-batch accuracy metric: a cheap on-GPU proxy
+            # (raw per-position emissions.argmax(), ignoring the CRF's
+            # transition structure) was tried here, but under real class
+            # imbalance (e.g. a ~378x sample weight on the rarest class)
+            # it diverged wildly from the actual CRF-decoded prediction --
+            # observed on a real training run collapsing to ~0.004 "train
+            # bin-acc" while the true (CRF-decoded) val bin-acc held at
+            # ~0.58-0.61 the whole time. The mismatch is real and
+            # inherent to how the CRF loss optimizes a joint sequence
+            # likelihood (leaning on learned transitions to fix up weak
+            # emissions), not a bug in the proxy computation itself -- so
+            # there's no cheap fix that stays honest. Train loss (below)
+            # is the real, correct training-time signal; val bin-acc
+            # (still the full CRF decode, paid once per validation batch
+            # per epoch, not once per training batch) is the real,
+            # correct accuracy signal.
 
         model.eval(); crf.eval()
         val_loss, val_total, val_correct, val_bins = 0.0, 0, 0, 0
@@ -994,14 +995,13 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
 
         t_loss = train_loss / train_total
         v_loss = val_loss / val_total
-        t_acc  = train_correct / train_bins
         v_acc  = val_correct / val_bins
 
         metrics.append({
             "epoch": epoch, "train_loss": round(t_loss, 6), "val_loss": round(v_loss, 6),
-            "train_bin_acc": round(t_acc, 4), "val_bin_acc": round(v_acc, 4),
+            "val_bin_acc": round(v_acc, 4),
         })
-        _log(f"Epoch {epoch:3d}/{epochs} | train loss {t_loss:.4f} bin-acc {t_acc:.3f} "
+        _log(f"Epoch {epoch:3d}/{epochs} | train loss {t_loss:.4f} "
              f"| val loss {v_loss:.4f} bin-acc {v_acc:.3f}")
 
         if v_loss < best_val_loss:

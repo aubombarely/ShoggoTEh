@@ -5,6 +5,29 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.3.2] — 2026-07-25
+
+### Fixed
+- **`train_classifier`'s "train bin-acc" metric was actively misleading**,
+  not just imprecise. It was a cheap on-GPU proxy (raw per-position
+  `emissions.argmax()`, ignoring the CRF's learned transition structure)
+  introduced in v0.3.1 to avoid the expensive Viterbi decode on every
+  training batch. On a real training run (Zea_mays, ~870K chunks, extreme
+  class imbalance with a ~378x sample weight on the rarest class) it
+  collapsed to ~0.004 after epoch 1 and stayed there, while the true
+  (CRF-decoded) val bin-acc held steady at ~0.58-0.61 the whole time —
+  the CRF loss optimizes a joint sequence likelihood that leans on learned
+  transitions to correct weak/skewed emissions, so raw emission-argmax
+  diverges wildly from the actual decoded prediction under real class
+  imbalance. There's no cheap fix that stays honest (e.g. reweighting the
+  proxy would just be a different, still-potentially-misleading
+  approximation), so the training-batch accuracy metric is removed
+  entirely. `train_dense()` now only tracks train loss (the real signal
+  driving backprop); val bin-acc (still the real, full CRF decode, paid
+  once per validation batch per epoch, not once per training batch)
+  remains the correct accuracy signal, in both the log output and
+  `training_metrics.tsv` (column `train_bin_acc` removed).
+
 ## [v0.3.1] — 2026-07-25
 
 ### Fixed
