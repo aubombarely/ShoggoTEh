@@ -5,6 +5,43 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.3.1] — 2026-07-25
+
+### Fixed
+
+- **`generate_embeddings` OOM on genome-scale corpora** — `df["embedding_flat"]
+  = [p.flatten().tolist() for p in pooled_list]` boxed every per-bin float32
+  value into an individual Python `float` object (~28 bytes each vs. 4 bytes
+  raw) before writing to Parquet. At genome scale (hundreds of millions of
+  bin embeddings — e.g. 870,816 Zea_mays chunks x 100 bins x 256 dims) this
+  inflated RAM usage far beyond the raw array size and silently OOM-killed
+  the process right after embedding finished, with no traceback (a kernel
+  `SIGKILL` gives no chance to log an exception). Fixed by storing/loading
+  embeddings as raw `float32` bytes (`np.ndarray.tobytes()` /
+  `np.frombuffer()`) instead of nested Python float lists. Parquet column
+  renamed `embedding_flat` -> `embedding_bytes` accordingly. Validated via a
+  direct write/read roundtrip through real Parquet I/O (500 synthetic
+  embeddings, byte-identical after roundtrip) and confirmed on the real
+  Zea_mays corpus (870,816 chunks) on production hardware.
+- **`train_classifier` CRF Viterbi decode dominating wall-clock time** — the
+  CRF's `decode()` was called on every training batch (not just validation)
+  purely to display a training-accuracy metric, and its backtrace looped in
+  Python with per-element GPU-tensor indexing (`tag = int(bp[b, tag])`) --
+  each such scalar extraction forces a synchronous GPU->CPU round trip,
+  ~6,400 of them per batch (batch_size x n_bins). Across ~10,885 training
+  batches/epoch on the real Zea_mays corpus this left the GPU mostly idle
+  waiting on the CPU rather than computing (observed: 21% GPU utilization,
+  641MB/15360MB VRAM used, ~59 min/epoch). Fixed two ways: (1) training-batch
+  accuracy now uses a cheap on-GPU emissions-argmax proxy instead of a full
+  CRF decode (loss, used for backprop, is unaffected); (2) `decode()`'s
+  backtrace itself is now vectorized -- backpointers and final tags are
+  transferred to CPU/numpy once each, then the backtrace uses vectorized
+  numpy fancy-indexing across the batch dimension instead of nested Python
+  loops with per-element GPU sync. This also speeds up validation and real
+  `predict` usage, not just training. Validated as exactly equivalent to the
+  original nested-loop implementation across 200 randomized trials (varying
+  batch size, sequence length, class count, including edge cases).
+
 ## [v0.3.0] — 2026-07-23
 
 ### Added

@@ -52,7 +52,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.3.0"
+VERSION = "v0.3.1"
 
 import argparse
 import getpass
@@ -852,7 +852,19 @@ def _build_dense_model_classes():
 
         def decode(self, emissions):
             """Viterbi decode. Returns a list (len B) of lists (len T) of
-            predicted class indices."""
+            predicted class indices.
+
+            The backtrace is vectorized over the batch dimension via numpy
+            fancy indexing after a single .cpu().numpy() transfer of the
+            backpointers and final tags, rather than looping in Python with
+            per-element GPU-tensor indexing (tag = int(bp[b, tag])). Each
+            such scalar extraction forces a synchronous GPU->CPU round trip;
+            doing that B*T times per call (previously called on every
+            training AND validation batch) was the dominant cost of
+            training, far exceeding the actual forward/backward pass -- the
+            GPU was mostly idle waiting on these tiny synchronous transfers,
+            not compute-bound.
+            """
             B, T, _ = emissions.shape
             backpointers = []
             score = self.start_transitions.unsqueeze(0) + emissions[:, 0]
@@ -862,17 +874,16 @@ def _build_dense_model_classes():
                 score = best_score + emissions[:, t]
                 backpointers.append(best_idx)
             score = score + self.end_transitions.unsqueeze(0)
-            _, best_final_tag = score.max(dim=1)
-            best_paths = []
-            for b in range(B):
-                tag = int(best_final_tag[b])
-                path = [tag]
-                for bp in reversed(backpointers):
-                    tag = int(bp[b, tag])
-                    path.append(tag)
-                path.reverse()
-                best_paths.append(path)
-            return best_paths
+            best_final_tag = score.argmax(dim=1)
+
+            best_paths_arr = np.zeros((B, T), dtype=np.int64)
+            best_paths_arr[:, T - 1] = best_final_tag.cpu().numpy()
+            if backpointers:
+                bp_stack = torch.stack(backpointers, dim=0).cpu().numpy()  # (T-1, B, C)
+                batch_idx = np.arange(B)
+                for i in range(T - 2, -1, -1):
+                    best_paths_arr[:, i] = bp_stack[i, batch_idx, best_paths_arr[:, i + 1]]
+            return best_paths_arr.tolist()
 
     return torch, nn, DenseTEClassifier, LinearChainCRF
 
@@ -952,7 +963,18 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
             train_loss  += loss.item() * len(yb)
             train_total += len(yb)
             with torch.no_grad():
-                preds = torch.tensor(crf.decode(emissions), device=device)
+                # Cheap proxy for training-time monitoring: per-position
+                # argmax of the emission scores, ignoring the CRF's
+                # transition structure. Stays entirely on-GPU with no
+                # Python-level looping, unlike a full CRF Viterbi decode --
+                # which was previously called on every training batch
+                # purely to display this metric, and dominated wall-clock
+                # time (tens of thousands of synchronous GPU->CPU round
+                # trips per epoch). Validation below still uses the real
+                # CRF-decoded accuracy, since decode() is only paid once per
+                # validation batch per epoch, not once per training batch,
+                # and decode() itself is now vectorized.
+                preds = emissions.argmax(dim=-1)
                 train_correct += (preds == yb).sum().item()
                 train_bins    += yb.numel()
 
