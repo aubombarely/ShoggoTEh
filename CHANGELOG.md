@@ -5,6 +5,43 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.7.0] — 2026-07-26
+
+### Added
+
+- **`train_dense_cnn`: v2 end-to-end dense CNN+CRF, no pretrained backbone**
+  (second step of the v2 architecture redesign, see
+  `.claude/plans/agile-chasing-willow.md`). A new `DilatedResidualCNN`
+  (`_build_dilated_cnn_model()`) operates directly on raw nucleotide
+  sequence (a small learned embedding, `Embedding(5, embed_dim)` for
+  A/C/G/T/N) through stride-1/same-padding dilated residual blocks
+  (`Conv1d -> GroupNorm -> GELU -> Conv1d -> GroupNorm -> residual add ->
+  GELU`, dilation schedule `1,2,4,8,16,32,64,128` repeated `--n_cycles`
+  times, ~12kb receptive field at the default 3 cycles) — no block ever
+  downsamples, so there is no reinflation step to undo at prediction time,
+  unlike the legacy 50bp-bin path. Feeds the **existing, unmodified**
+  `LinearChainCRF` (already validated this session) at true 1bp resolution.
+  New `load_dense_sequences()` loads a `--bin_size 1` `prepare_dataset`
+  corpus (raw sequence + `base_labels_bytes`, decoded via the new
+  `encode_sequence()` — a vectorized 256-entry ASCII lookup table, not a
+  per-character Python loop). Reuses `train_dense()`, `_select_balanced_chunks()`
+  (`--balanced_corpus`), and `--class_weight balanced` unchanged, since all
+  three are already architecture-agnostic. Verified via a real (not just
+  shape-check) CPU training run on synthetic data with a designed learnable
+  signal (GC-rich = LTR, AT-rich = DNA): loss dropped monotonically
+  (2805.8 -> 43.9 over 8 epochs), val bin-accuracy reached 0.998, and
+  per-class precision/recall for the injected classes were ~0.998 —
+  confirming correct forward/backward pass and CRF integration at 1bp
+  resolution end-to-end, not just that the code runs.
+- Known follow-up (not blocking, already flagged in the v2 plan): the
+  CRF's `_forward_alg`/`decode` are sequential Python loops over sequence
+  length, so wall-clock cost scales with `chunk_size` — measured ~91s for
+  8 epochs on 160 tiny chunks at `seq_len=2000` on CPU. Mitigation
+  (windowed/chunked Viterbi) deferred until real Zea_mays pilot numbers are
+  in hand, per the plan's sequencing.
+
+---
+
 ## [v0.6.0] — 2026-07-26
 
 ### Added

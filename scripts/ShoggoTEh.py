@@ -17,6 +17,14 @@ Sub-commands
                           labeler on the per-bin embeddings.
                           Output: {outdir}/classifier.pt, label_encoder.json,
                                   model_config.json
+  train_dense_cnn        v2 (see .claude/plans/agile-chasing-willow.md):
+                          train a stride-1 dilated-residual CNN + linear-
+                          chain CRF end-to-end on raw sequence from a
+                          'prepare_dataset --bin_size 1' corpus -- true
+                          single-nucleotide resolution, no pretrained
+                          backbone, no embedding step.
+                          Output: {outdir}/classifier.pt, label_encoder.json,
+                                  model_config.json
   predict                Slide windows across a new genome, embed, run the
                           dense CNN+CRF forward pass + Viterbi decode, and
                           run-length-encode consecutive same-label bins into
@@ -52,7 +60,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.6.0"
+VERSION = "v0.7.0"
 
 import argparse
 import getpass
@@ -239,6 +247,24 @@ DEFAULT_LABELS = ["LTR", "DNA", "LINE", "SINE", "Unknown_repeat",
 def map_repeat_class(classification: str) -> str:
     top = str(classification).split("/")[0]
     return REPEAT_CLASS_MAP.get(top, "Other_repeat")
+
+
+# Nucleotide encoding for the v2 end-to-end dense CNN (train_dense_cnn /
+# predict_dense_cnn): raw sequence -> int64 indices, no pretrained backbone.
+_NT_LOOKUP = np.full(256, 4, dtype=np.int64)  # default: N (or any other IUPAC code)
+for _i, _c in enumerate("ACGT"):
+    _NT_LOOKUP[ord(_c)] = _i
+del _i, _c
+
+
+def encode_sequence(seq: str) -> np.ndarray:
+    """Vectorized encode of an uppercase nucleotide string to int64 indices
+    (A=0, C=1, G=2, T=3, everything else incl. N/ambiguity codes=4) via a
+    256-entry ASCII lookup table -- avoids a per-character Python loop,
+    which would be prohibitively slow at training-corpus scale (millions
+    of positions)."""
+    raw = np.frombuffer(seq.encode("ascii"), dtype=np.uint8)
+    return _NT_LOOKUP[raw]
 
 
 # ── Windowing (shared: prepare_dataset + predict) ──────────────────────────────
@@ -1149,6 +1175,341 @@ def _build_dense_model_classes():
             return best_paths_arr.tolist()
 
     return torch, nn, DenseTEClassifier, LinearChainCRF
+
+
+###############################################################################
+# train_dense_cnn -- v2 end-to-end dense CNN+CRF on raw sequence (no
+# pretrained backbone). See .claude/plans/agile-chasing-willow.md.
+###############################################################################
+
+def _build_dilated_cnn_model():
+    """Import torch lazily and define the v2 model: a stride-1 dilated
+    residual CNN tower operating directly on raw nucleotide sequence (no
+    pretrained backbone, no pooling -- every input base keeps its own
+    position-aligned feature vector throughout the network). Reuses
+    LinearChainCRF unchanged from _build_dense_model_classes() rather than
+    redefining it -- it is architecture-agnostic (only needs per-position
+    emissions of shape (B, T, C)) and was already validated this session
+    (200-trial randomized equivalence test for the vectorized Viterbi
+    decode). Returns (torch, nn, DilatedResidualCNN, LinearChainCRF)."""
+    torch, nn, _DenseTEClassifier, LinearChainCRF = _build_dense_model_classes()
+
+    class ResidualDilatedBlock(nn.Module):
+        """Conv1d -> GroupNorm -> GELU -> Conv1d -> GroupNorm -> residual
+        add -> GELU, both convs at the same dilation, same-padding (stride
+        1) so sequence length is preserved exactly -- this is the
+        resolution-preserving mechanism: no block in the tower ever
+        downsamples, so there is no reinflation step for predict to
+        undo, unlike the legacy 50bp-bin path's pool-then-merge design."""
+
+        def __init__(self, channels: int, kernel_size: int, dilation: int, dropout: float):
+            super().__init__()
+            pad = (kernel_size - 1) * dilation // 2
+            self.conv1 = nn.Conv1d(channels, channels, kernel_size,
+                                   padding=pad, dilation=dilation)
+            self.norm1 = nn.GroupNorm(min(8, channels), channels)
+            self.conv2 = nn.Conv1d(channels, channels, kernel_size,
+                                   padding=pad, dilation=dilation)
+            self.norm2 = nn.GroupNorm(min(8, channels), channels)
+            self.act = nn.GELU()
+            self.dropout = nn.Dropout(dropout)
+
+        def forward(self, x):
+            # x: (B, channels, T)
+            residual = x
+            x = self.act(self.norm1(self.conv1(x)))
+            x = self.dropout(x)
+            x = self.norm2(self.conv2(x))
+            return self.act(x + residual)
+
+    class DilatedResidualCNN(nn.Module):
+        """Embedding -> stem conv -> N cycles of exponentially-dilated
+        residual blocks -> per-position linear classifier. Structurally
+        analogous to Helixer's CNN front end / ANNEVO's local module /
+        SegmentNT's validated single-nucleotide segmentation approach --
+        a single end-to-end model, no alignment-heavy classical tools and
+        no large pretrained genomic LM in the loop (see plan Context for
+        why both were ruled out: LTRharvest/LTR_FINDER-based cascades
+        reproduce EarlGrey's own bottleneck since LTR is the dominant
+        genome fraction; Hyena-DNA embedding was the single largest real
+        measured cost this project hit, ~11.8h/genome)."""
+
+        def __init__(self, n_classes: int, channels: int = 128,
+                    kernel_size: int = 9, n_cycles: int = 3,
+                    dilation_schedule=(1, 2, 4, 8, 16, 32, 64, 128),
+                    embed_dim: int = 16, dropout: float = 0.1):
+            super().__init__()
+            self.embedding = nn.Embedding(5, embed_dim)  # A,C,G,T,N
+            self.stem = nn.Conv1d(embed_dim, channels, kernel_size=1)
+            blocks = []
+            for _ in range(n_cycles):
+                for d in dilation_schedule:
+                    blocks.append(ResidualDilatedBlock(channels, kernel_size, d, dropout))
+            self.blocks = nn.ModuleList(blocks)
+            self.classifier = nn.Linear(channels, n_classes)
+
+        def forward(self, x):
+            # x: (B, T) int64 nucleotide indices
+            x = self.embedding(x)      # (B, T, embed_dim)
+            x = x.transpose(1, 2)      # (B, embed_dim, T)
+            x = self.stem(x)           # (B, channels, T)
+            for block in self.blocks:
+                x = block(x)
+            x = x.transpose(1, 2)      # (B, T, channels)
+            return self.classifier(x)  # (B, T, n_classes) -- emissions
+
+    return torch, nn, DilatedResidualCNN, LinearChainCRF
+
+
+def load_dense_sequences(chunks_dir: Path, labels: list) -> tuple:
+    """Load a --bin_size 1 prepare_dataset corpus (raw sequence + per-base
+    int8 labels) for train_dense_cnn, pooling every species' Parquet file
+    the same way load_dense_embeddings() does for the legacy backbone-
+    embeddings corpus. Returns (X, y, seq_len) where X is (n_chunks,
+    seq_len) int64 nucleotide indices and y is (n_chunks, seq_len) int64
+    label indices."""
+    parquet_files = sorted(chunks_dir.glob("*.parquet"))
+    if not parquet_files:
+        print(f"ERROR: no Parquet files found in {chunks_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    _log(f"Loading raw-sequence chunks from {len(parquet_files)} species: "
+         f"{[f.stem for f in parquet_files]}")
+    df = pd.concat([pd.read_parquet(p) for p in parquet_files], ignore_index=True)
+    _log(f"Total chunks loaded: {len(df):,}")
+
+    if "base_labels_bytes" not in df.columns:
+        print(f"ERROR: {chunks_dir} does not look like a --bin_size 1 "
+              f"prepare_dataset corpus (missing base_labels_bytes column). "
+              f"Regenerate with: prepare_dataset --bin_size 1 ...", file=sys.stderr)
+        sys.exit(1)
+
+    bin_size_vals = df["bin_size"].unique()
+    if len(bin_size_vals) > 1 or int(bin_size_vals[0]) != 1:
+        print(f"ERROR: corpus does not have a uniform bin_size of 1: "
+              f"{bin_size_vals}. train_dense_cnn requires a --bin_size 1 "
+              f"prepare_dataset corpus.", file=sys.stderr)
+        sys.exit(1)
+
+    n_bins_vals = df["n_bins"].unique()
+    if len(n_bins_vals) > 1:
+        print(f"ERROR: inconsistent chunk length across the corpus: "
+              f"{n_bins_vals}. Regenerate all species with the same "
+              f"--chunk_size.", file=sys.stderr)
+        sys.exit(1)
+    seq_len = int(n_bins_vals[0])
+
+    if labels != DEFAULT_LABELS:
+        _log("  WARNING: --labels differs from DEFAULT_LABELS, but "
+             "base_labels_bytes was encoded using DEFAULT_LABELS order at "
+             "prepare_dataset time -- results will be wrong unless the "
+             "label sets match exactly, in the same order.")
+
+    X = np.stack([encode_sequence(s) for s in df["sequence"]])
+    y = np.stack([
+        np.frombuffer(b, dtype=np.int8).astype(np.int64)
+        for b in df["base_labels_bytes"]
+    ])
+
+    return X, y, seq_len
+
+
+def run_train_dense_cnn(args) -> None:
+    outdir = args.outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    logs_dir = outdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _open_log(logs_dir, "train_dense_cnn")
+
+    chunks_dir = args.chunks_dir.resolve()
+    _validate_inputs([("--chunks_dir", chunks_dir)])
+
+    if args.dry_run:
+        _banner("Dry run — no steps will be executed")
+        _log(f"  chunks_dir     : {chunks_dir}/")
+        _log(f"  outdir         : {outdir}/")
+        _log(f"  epochs         : {args.epochs}")
+        _log(f"  batch_size     : {args.batch_size}")
+        _log(f"  lr             : {args.lr}")
+        _log(f"  channels       : {args.channels}")
+        _log(f"  kernel_size    : {args.kernel_size}")
+        _log(f"  n_cycles       : {args.n_cycles}")
+        _log(f"  embed_dim      : {args.embed_dim}")
+        _log(f"  dropout        : {args.dropout}")
+        _log(f"  val_fraction   : {args.val_fraction}")
+        _log(f"  patience       : {args.patience}")
+        _log(f"  class_weight   : {args.class_weight}")
+        _log(f"  balanced_corpus: {args.balanced_corpus}")
+        if args.balanced_corpus:
+            _log(f"  target_bins_per_class: {args.target_bins_per_class}")
+        _log(f"  labels         : {args.labels}")
+        _log("  Steps that would run: load raw-sequence chunks -> train "
+             "dilated-CNN+CRF sequence labeler (1bp resolution) -> "
+             "evaluate -> save model")
+        _log("  Exiting (--dry_run).")
+        sys.exit(0)
+
+    import torch
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    _log(f"Using device: {device}")
+
+    X, y, seq_len = load_dense_sequences(chunks_dir, args.labels)
+    _log(f"Loaded {X.shape[0]:,} chunks | seq_len={seq_len}")
+
+    if args.balanced_corpus:
+        _log(f"Building balanced multi-genome corpus (target: "
+             f"{args.target_bins_per_class:,} bases/class, rarest-first chunk selection) ...")
+        sel_idx, achieved = _select_balanced_chunks(
+            y, len(args.labels), args.target_bins_per_class, args.seed)
+        _log(f"Selected {len(sel_idx):,} / {X.shape[0]:,} chunks")
+        for lbl, n_achieved in zip(args.labels, achieved):
+            flag = "" if n_achieved >= args.target_bins_per_class else "  [data-limited]"
+            _log(f"    {lbl:15s} {int(n_achieved):>10,} / {args.target_bins_per_class:,} bases{flag}")
+        X, y = X[sel_idx], y[sel_idx]
+
+    # Stratify the chunk-level split by each chunk's dominant base label
+    # (a per-chunk proxy — the classifier itself trains at base resolution).
+    strat_key = [Counter(row).most_common(1)[0][0] for row in y]
+    idx_train, idx_val = train_test_split(
+        np.arange(len(X)), test_size=args.val_fraction,
+        stratify=strat_key, random_state=args.seed,
+    )
+    X_train, X_val = X[idx_train], X[idx_val]
+    y_train, y_val = y[idx_train], y[idx_val]
+    _log(f"Train: {len(X_train):,} chunks | Val: {len(X_val):,} chunks")
+
+    torch_mod, nn, DilatedResidualCNN, LinearChainCRF = _build_dilated_cnn_model()
+
+    class_weights = None
+    if args.class_weight == "balanced":
+        y_train_flat = y_train.reshape(-1)
+        present_classes = np.unique(y_train_flat)
+        w_present = compute_class_weight(class_weight="balanced",
+                                         classes=present_classes, y=y_train_flat)
+        full_weights = np.ones(len(args.labels), dtype=np.float32)
+        for cls_idx, w in zip(present_classes, w_present):
+            full_weights[cls_idx] = w
+        class_weights = torch.tensor(full_weights, dtype=torch.float32).to(device)
+        _log("Class weights (balanced, inverse per-base training frequency):")
+        for lbl, w in zip(args.labels, full_weights):
+            _log(f"    {lbl:15s} weight={w:.4f}")
+    else:
+        _log("Class weighting disabled (--class_weight none)")
+
+    from torch.utils.data import DataLoader, TensorDataset
+    train_loader = DataLoader(
+        TensorDataset(torch.tensor(X_train, dtype=torch.long),
+                     torch.tensor(y_train, dtype=torch.long)),
+        batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(
+        TensorDataset(torch.tensor(X_val, dtype=torch.long),
+                     torch.tensor(y_val, dtype=torch.long)),
+        batch_size=args.batch_size, shuffle=False)
+
+    model = DilatedResidualCNN(n_classes=len(args.labels), channels=args.channels,
+                               kernel_size=args.kernel_size, n_cycles=args.n_cycles,
+                               embed_dim=args.embed_dim, dropout=args.dropout).to(device)
+    crf = LinearChainCRF(n_classes=len(args.labels)).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    _log(f"Model: Embedding(5->{args.embed_dim}) -> Conv1d(1x1) -> "
+         f"{args.n_cycles} x 8 ResidualDilatedBlock(channels={args.channels}, "
+         f"k={args.kernel_size}) -> Linear({args.channels}, {len(args.labels)}) "
+         f"-> LinearChainCRF  ({n_params:,} params)")
+
+    label_encoder = {"label_to_idx": {lbl: i for i, lbl in enumerate(args.labels)},
+                     "idx_to_label": {str(i): lbl for i, lbl in enumerate(args.labels)}}
+    with open(outdir / "label_encoder.json", "w") as fh:
+        json.dump(label_encoder, fh, indent=2)
+
+    model_config = {
+        "architecture": "dilated_cnn_v2", "n_classes": len(args.labels),
+        "channels": args.channels, "kernel_size": args.kernel_size,
+        "n_cycles": args.n_cycles, "embed_dim": args.embed_dim,
+        "dropout": args.dropout, "seq_len_trained_on": seq_len,
+    }
+    with open(outdir / "model_config.json", "w") as fh:
+        json.dump(model_config, fh, indent=2)
+    _log(f"Label encoder + model config saved to {outdir}")
+
+    t_start = time.monotonic()
+    tracker = _start_tracker("ShoggoTEh_train_dense_cnn", logs_dir, args.disable_co2_tracking)
+
+    metrics = train_dense(torch_mod, nn, model, crf, train_loader, val_loader, device,
+                          args.epochs, args.lr, args.patience, outdir, class_weights)
+
+    emissions_kg = _stop_tracker(tracker)
+
+    metrics_path = outdir / "training_metrics.tsv"
+    pd.DataFrame(metrics).to_csv(metrics_path, sep="\t", index=False)
+    _log(f"Training metrics saved to {metrics_path}")
+
+    _log("Loading best model for final (base-level) evaluation ...")
+    state = torch.load(outdir / "classifier.pt", map_location=device)
+    model.load_state_dict(state["model"])
+    crf.load_state_dict(state["crf"])
+    model.eval(); crf.eval()
+
+    all_preds, all_true = [], []
+    with torch.no_grad():
+        for Xb, yb in val_loader:
+            emissions = model(Xb.to(device))
+            preds = crf.decode(emissions)
+            all_preds.extend([p for seq in preds for p in seq])
+            all_true.extend(yb.reshape(-1).tolist())
+
+    report = classification_report(all_true, all_preds, labels=list(range(len(args.labels))),
+                                   target_names=args.labels, digits=3, zero_division=0)
+    _log(f"Validation base-level classification report:\n{report}")
+    (outdir / "classification_report.txt").write_text(report)
+
+    if emissions_kg is not None:
+        _log(f"Carbon footprint: {emissions_kg:.6f} kg CO2 equivalent")
+
+    elapsed_s   = time.monotonic() - t_start
+    peak_mem_mb = _peak_mem_mb()
+    _log(f"Wall-clock time   : {elapsed_s:.1f} s ({elapsed_s/60:.1f} min)")
+    _log(f"Peak memory (RSS) : {peak_mem_mb:.1f} MB")
+
+    best_val_loss = min((m["val_loss"] for m in metrics), default=None)
+    summary = {
+        "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": VERSION,
+        "input_chunks_dir": str(chunks_dir),
+        "n_classes":  len(args.labels),
+        "seq_len":    seq_len,
+        "n_params":   n_params,
+        "n_train_chunks": len(X_train),
+        "n_val_chunks":    len(X_val),
+        "best_val_loss": best_val_loss,
+        "n_epochs_run":  len(metrics),
+        "parameters": {
+            "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
+            "channels": args.channels, "kernel_size": args.kernel_size,
+            "n_cycles": args.n_cycles, "embed_dim": args.embed_dim,
+            "dropout": args.dropout, "val_fraction": args.val_fraction,
+            "patience": args.patience, "class_weight": args.class_weight,
+            "balanced_corpus": args.balanced_corpus,
+            "target_bins_per_class": args.target_bins_per_class if args.balanced_corpus else None,
+            "seed": args.seed,
+        },
+        "resource_usage": {
+            "wall_clock_s":       round(elapsed_s, 1),
+            "peak_mem_mb":        round(peak_mem_mb, 1),
+            "emissions_kg_CO2eq": emissions_kg,
+        },
+    }
+    _write_summary(outdir, summary)
+    _close_log()
 
 
 def load_dense_embeddings(embeddings_dir: Path, labels: list) -> tuple:
@@ -2231,6 +2592,70 @@ def _build_parser() -> argparse.ArgumentParser:
     opt.add_argument("--disable_co2_tracking", action="store_true",
                      help="Disable carbon footprint tracking")
 
+    # ── train_dense_cnn (v2: end-to-end, no pretrained backbone) ────────────────
+    tdc = sub.add_parser("train_dense_cnn",
+                         help="v2: train a stride-1 dilated-residual CNN + "
+                              "linear-chain CRF end-to-end on raw sequence "
+                              "at true single-nucleotide (1bp) resolution "
+                              "-- no pretrained backbone, no embedding step")
+    req = tdc.add_argument_group("required")
+    req.add_argument("--chunks_dir", required=True, type=Path, metavar="DIR",
+                     help="Directory with per-species Parquet files from "
+                          "'prepare_dataset --bin_size 1'")
+    req.add_argument("--outdir", required=True, type=Path, metavar="DIR",
+                     help="Output directory for model weights, config, metrics")
+    opt = tdc.add_argument_group("optional")
+    opt.add_argument("--labels", nargs="+", default=DEFAULT_LABELS, metavar="LBL",
+                     help=f"Ordered list of class labels (default: {DEFAULT_LABELS}). "
+                          f"Must match DEFAULT_LABELS order -- base_labels_bytes was "
+                          f"encoded with that order at prepare_dataset time.")
+    opt.add_argument("--epochs", type=int, default=50, metavar="N",
+                     help="Maximum training epochs (default: 50)")
+    opt.add_argument("--batch_size", type=int, default=16, metavar="N",
+                     help="Mini-batch size in chunks/sequences (default: 16 -- "
+                          "smaller than train_classifier's 64 since sequences "
+                          "here are chunk_size long, e.g. 5000bp, not n_bins)")
+    opt.add_argument("--lr", type=float, default=1e-3, metavar="F",
+                     help="Adam learning rate (default: 0.001)")
+    opt.add_argument("--channels", type=int, default=128, metavar="N",
+                     help="Dilated residual tower channel width (default: 128)")
+    opt.add_argument("--kernel_size", type=int, default=9, metavar="N",
+                     help="Conv kernel size in bases (default: 9)")
+    opt.add_argument("--n_cycles", type=int, default=3, metavar="N",
+                     help="Number of times the dilation schedule "
+                          "(1,2,4,8,16,32,64,128) repeats (default: 3, "
+                          "~12kb receptive field). Trivially extensible -- "
+                          "increase if benchmarking shows insufficient "
+                          "receptive field for the longest LTRs.")
+    opt.add_argument("--embed_dim", type=int, default=16, metavar="N",
+                     help="Nucleotide embedding dimension (default: 16)")
+    opt.add_argument("--dropout", type=float, default=0.1, metavar="F",
+                     help="Dropout probability (default: 0.1)")
+    opt.add_argument("--val_fraction", type=float, default=0.2, metavar="F",
+                     help="Fraction of chunks held out for validation (default: 0.2)")
+    opt.add_argument("--patience", type=int, default=10, metavar="N",
+                     help="Early-stopping patience in epochs (default: 10)")
+    opt.add_argument("--class_weight", choices=["balanced", "none"], default="balanced",
+                     help="'balanced' (default) weights the CRF's per-sequence "
+                          "NLL by inverse per-base training-set class frequency. "
+                          "'none' disables it.")
+    opt.add_argument("--balanced_corpus", action="store_true",
+                     help="Build the training set via quota-capped, multi-genome "
+                          "chunk selection instead of using every pooled chunk "
+                          "(see train_classifier's flag of the same name -- "
+                          "identical logic, reused unchanged).")
+    opt.add_argument("--target_bins_per_class", type=int, default=20000, metavar="N",
+                     help="Target per-class base count for --balanced_corpus "
+                          "(default: 20000). Ignored unless --balanced_corpus.")
+    opt.add_argument("--seed", type=int, default=42, metavar="N",
+                     help="Random seed (default: 42)")
+    opt.add_argument("--device", default=None, metavar="DEV",
+                     help="'cuda', 'mps', or 'cpu'. Auto-detected if omitted.")
+    opt.add_argument("--dry_run", action="store_true",
+                     help="Validate inputs and print planned steps, then exit")
+    opt.add_argument("--disable_co2_tracking", action="store_true",
+                     help="Disable carbon footprint tracking")
+
     # ── predict ───────────────────────────────────────────────────────────────
     dp = sub.add_parser("predict",
                         help="Dense CNN+CRF forward pass + Viterbi decode "
@@ -2312,6 +2737,8 @@ def main() -> None:
         run_generate_embeddings(args)
     elif args.command == "train_classifier":
         run_train_classifier(args)
+    elif args.command == "train_dense_cnn":
+        run_train_dense_cnn(args)
     elif args.command == "predict":
         run_predict(args)
     elif args.command == "compare_te_annotation":
