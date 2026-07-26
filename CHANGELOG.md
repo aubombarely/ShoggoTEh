@@ -5,6 +5,49 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.8.0] — 2026-07-26
+
+### Added
+
+- **`predict_dense_cnn`: v2 genome-scale inference, no embedding step**
+  (third and final piece of the v2 pipeline restructuring — the
+  train/predict side is now complete; see
+  `.claude/plans/agile-chasing-willow.md`). `make_predict_segments()`
+  tiles each chromosome/scaffold into non-overlapping *output* segments,
+  each backed by a (possibly larger) inference window extending past the
+  segment by up to `--overlap`/2 bases on each side for extra CRF/
+  receptive-field context — the standard overlap-trim pattern, verified
+  to give full, gap-free, non-overlapping coverage across a range of
+  chromosome lengths including ones shorter than the window itself (the
+  fully-convolutional `DilatedResidualCNN` has no fixed-length assumption
+  anywhere, so short scaffolds need no padding). Same-length windows
+  (true for every window in a chromosome except its last) are batched
+  together before the forward pass + CRF decode, which amortizes the
+  CRF's sequential Python-loop decode cost across the whole batch, not
+  just the model's own compute. Predictions are merged into BED intervals
+  via a new **streaming** run-length-encoder (`_stream_rle_step()`)
+  instead of the legacy `rle_encode_bins()`, which requires materializing
+  one dict per base first — at genome scale (potentially billions of
+  bases) that would reproduce the exact Python-object-boxing memory
+  blowup already fixed once this session for embeddings; the streaming
+  version holds only the single currently-open interval plus the final
+  merged-interval list (bounded by real TE element count, not genome
+  length). Verified equivalent to `rle_encode_bins()` on 500 randomized
+  synthetic records (byte-identical output), and verified end-to-end on
+  real trained-model output: predicted a full 200kb synthetic genome in
+  1.2s wall-clock, recovering the injected ground-truth LTR/DNA/Intergenic
+  pattern at 99.81% base-level agreement (per-class recall ~0.998).
+  `--window_size` defaults to 5000 (not the plan's original 24kb target)
+  with the reasoning logged directly in the flag's own help text: the
+  CRF's forward/decode are sequential Python loops over sequence length,
+  so wall-clock cost scales with window size; 5000 already exceeds little
+  useful context relative to the model's own ~12kb receptive field at the
+  default `--n_cycles 3`, and keeps predict practical until that loop is
+  optimized (windowed/chunked Viterbi, already flagged as a known
+  follow-up in v0.7.0). Increase once benchmarked on real data.
+
+---
+
 ## [v0.7.0] — 2026-07-26
 
 ### Added

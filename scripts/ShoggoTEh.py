@@ -25,6 +25,11 @@ Sub-commands
                           backbone, no embedding step.
                           Output: {outdir}/classifier.pt, label_encoder.json,
                                   model_config.json
+  predict_dense_cnn      v2: slide overlap-trimmed windows across a new
+                          genome, run the dilated CNN+CRF forward pass +
+                          Viterbi decode per window at true 1bp resolution,
+                          streaming run-length-encode into BED intervals.
+                          Output: {outdir}/{prefix}.bed
   predict                Slide windows across a new genome, embed, run the
                           dense CNN+CRF forward pass + Viterbi decode, and
                           run-length-encode consecutive same-label bins into
@@ -60,7 +65,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.7.0"
+VERSION = "v0.8.0"
 
 import argparse
 import getpass
@@ -1957,6 +1962,270 @@ def load_classifier_dense(model_dir: Path, device):
     return model, crf, labels
 
 
+def load_dense_cnn_classifier(model_dir: Path, device):
+    """Load a train_dense_cnn (v2) model — mirrors load_classifier_dense()
+    but reconstructs DilatedResidualCNN from model_config.json instead of
+    DenseTEClassifier, and requires no backbone/embedding provenance
+    (there is none — the v2 model trains end-to-end on raw sequence)."""
+    encoder_path = model_dir / "label_encoder.json"
+    config_path  = model_dir / "model_config.json"
+    weights_path = model_dir / "classifier.pt"
+    for p, flag in ((encoder_path, "label_encoder.json"), (config_path, "model_config.json"),
+                    (weights_path, "classifier.pt")):
+        if not p.exists():
+            print(f"ERROR: {flag} not found in {model_dir}", file=sys.stderr)
+            sys.exit(1)
+
+    with open(encoder_path) as fh:
+        enc = json.load(fh)
+    labels = [enc["idx_to_label"][str(i)] for i in range(len(enc["idx_to_label"]))]
+
+    with open(config_path) as fh:
+        cfg = json.load(fh)
+    if cfg.get("architecture") != "dilated_cnn_v2":
+        print(f"ERROR: {model_dir} does not look like a train_dense_cnn (v2) "
+              f"model (model_config.json architecture={cfg.get('architecture')!r}, "
+              f"expected 'dilated_cnn_v2'). Use the legacy 'predict' subcommand "
+              f"for train_classifier models.", file=sys.stderr)
+        sys.exit(1)
+
+    _, _, DilatedResidualCNN, LinearChainCRF = _build_dilated_cnn_model()
+    model = DilatedResidualCNN(n_classes=cfg["n_classes"], channels=cfg["channels"],
+                               kernel_size=cfg["kernel_size"], n_cycles=cfg["n_cycles"],
+                               embed_dim=cfg["embed_dim"], dropout=0.0)
+    crf = LinearChainCRF(n_classes=cfg["n_classes"])
+
+    import torch
+    state = torch.load(weights_path, map_location=device)
+    model.load_state_dict(state["model"])
+    crf.load_state_dict(state["crf"])
+    model.eval().to(device)
+    crf.eval().to(device)
+    _log(f"Classifier loaded: channels={cfg['channels']} n_cycles={cfg['n_cycles']} "
+         f"kernel_size={cfg['kernel_size']} n_classes={cfg['n_classes']}")
+    _log(f"Labels: {labels}")
+    return model, crf, labels
+
+
+def make_predict_segments(chrom_len: int, window_size: int, overlap: int) -> list:
+    """Tile a chromosome into non-overlapping output segments, each backed
+    by a (possibly larger) inference window extending past the segment on
+    both sides by up to overlap//2 bases for extra CRF/receptive-field
+    context -- the standard overlap-trim pattern for sliding-window
+    genomic inference. Window length is clamped to the chromosome length,
+    never padded: the fully-convolutional DilatedResidualCNN has no
+    fixed-length assumption anywhere, so short scaffolds are handled
+    natively. Returns [(seg_start, seg_end, win_start, win_end), ...]."""
+    stride = window_size - overlap
+    if stride <= 0:
+        raise ValueError(f"overlap ({overlap}) must be smaller than window_size ({window_size})")
+    segments = []
+    pos = 0
+    while pos < chrom_len:
+        seg_start = pos
+        seg_end = min(pos + stride, chrom_len)
+        win_start = max(0, seg_start - overlap // 2)
+        win_end = min(chrom_len, win_start + window_size)
+        win_start = max(0, win_end - window_size)
+        segments.append((seg_start, seg_end, win_start, win_end))
+        pos = seg_end
+    return segments
+
+
+def _stream_rle_step(intervals: list, open_iv, chrom: str, pos: int,
+                     label: str, prob: float):
+    """Incrementally run-length-encode one more (chrom, pos, label, prob)
+    observation into `intervals`, extending or closing `open_iv` as
+    needed. Genome-scale predict_dense_cnn produces one prediction per
+    base (potentially billions across a real genome) -- materializing one
+    dict per base before merging (as the legacy bin-level rle_encode_bins
+    does, fine at 50bp-bin scale) would reproduce the exact class of
+    Python-object-boxing memory blowup already fixed once this session for
+    embeddings. This keeps only the single currently-open interval plus
+    the final merged-interval list (bounded by real TE element count, not
+    genome length) in memory. Caller must flush the final `open_iv` after
+    the loop ends (it is never auto-flushed on the last position)."""
+    if (open_iv is not None and open_iv["chrom"] == chrom
+            and open_iv["label"] == label and open_iv["end"] == pos):
+        open_iv["end"] += 1
+        open_iv["prob_sum"] += prob
+        open_iv["prob_n"] += 1
+        return open_iv
+    if open_iv is not None:
+        open_iv["confidence"] = open_iv["prob_sum"] / open_iv["prob_n"]
+        del open_iv["prob_sum"], open_iv["prob_n"]
+        intervals.append(open_iv)
+    return {"chrom": chrom, "start": pos, "end": pos + 1, "label": label,
+           "prob_sum": prob, "prob_n": 1}
+
+
+def run_predict_dense_cnn(args) -> None:
+    fasta_path = args.fasta.resolve()
+    model_dir  = args.model_dir.resolve()
+    outdir     = args.outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    logs_dir = outdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _open_log(logs_dir, "predict_dense_cnn")
+
+    _validate_inputs([("--fasta", fasta_path), ("--model_dir", model_dir)])
+
+    if args.overlap >= args.window_size:
+        print(f"ERROR: --overlap ({args.overlap}) must be smaller than "
+              f"--window_size ({args.window_size})", file=sys.stderr)
+        sys.exit(1)
+
+    prefix = args.prefix or fasta_path.stem
+
+    if args.dry_run:
+        _banner("Dry run — no steps will be executed")
+        _log(f"  fasta          : {fasta_path}")
+        _log(f"  model_dir      : {model_dir}/")
+        _log(f"  outdir         : {outdir}/")
+        _log(f"  prefix         : {prefix}")
+        _log(f"  window_size    : {args.window_size}")
+        _log(f"  overlap        : {args.overlap}")
+        _log(f"  max_n_fraction : {args.max_n_fraction}")
+        _log(f"  batch_size     : {args.batch_size}")
+        _log("  Steps that would run: tile genome into overlap-trimmed "
+             "segments -> batched dilated CNN+CRF forward pass + Viterbi "
+             "decode -> keep each segment's core -> streaming run-length-"
+             "encode -> BED")
+        _log("  Exiting (--dry_run).")
+        sys.exit(0)
+
+    import torch
+    import torch.nn.functional as F
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    _log(f"Using device: {device}")
+
+    model, crf, labels = load_dense_cnn_classifier(model_dir, device)
+
+    t_start = time.monotonic()
+    tracker = _start_tracker("ShoggoTEh_predict_dense_cnn", logs_dir, args.disable_co2_tracking)
+
+    _log(f"Loading genome: {fasta_path}")
+    fasta = Fasta(str(fasta_path))
+
+    intervals = []
+    open_iv = None
+    label_counts = Counter()
+    n_segments_total = 0
+    n_segments_skipped_n = 0
+
+    def _flush_batch(pending):
+        """pending: list of (chrom, seg_start, seg_end, win_start, win_end,
+        seq) tuples, all sharing the same window length (batching requires
+        a rectangular tensor) and already in ascending genomic order. Runs
+        one batched forward pass + CRF decode (batching amortizes the
+        CRF's sequential Python-loop decode cost across every sequence in
+        the batch, not just the model's own compute), then streams each
+        window's core region into the running RLE state in the same
+        order the windows were generated."""
+        nonlocal open_iv
+        if not pending:
+            return
+        Xb = torch.tensor(np.stack([encode_sequence(p[5]) for p in pending]),
+                          dtype=torch.long, device=device)
+        with torch.no_grad():
+            emissions = model(Xb)
+            probs = F.softmax(emissions, dim=2).cpu().numpy()
+            paths = crf.decode(emissions)
+        for (chrom, seg_start, seg_end, win_start, win_end, _seq), path, prob_row in \
+                zip(pending, paths, probs):
+            core_start_local = seg_start - win_start
+            core_end_local   = seg_end - win_start
+            for i in range(core_start_local, core_end_local):
+                pos = win_start + i
+                cls_idx = path[i]
+                label = labels[cls_idx]
+                label_counts[label] += 1
+                open_iv = _stream_rle_step(intervals, open_iv, chrom, pos,
+                                           label, float(prob_row[i, cls_idx]))
+
+    pending, pending_len = [], None
+    for chrom in fasta.keys():
+        chrom_len = len(fasta[chrom])
+        if chrom_len == 0:
+            continue
+        segments = make_predict_segments(chrom_len, args.window_size, args.overlap)
+        _log(f"{chrom}: {chrom_len:,}bp -> {len(segments):,} segments")
+
+        for seg_start, seg_end, win_start, win_end in segments:
+            n_segments_total += 1
+            win_seq = str(fasta[chrom][win_start:win_end]).upper()
+            n_frac = win_seq.count("N") / len(win_seq) if win_seq else 1.0
+            if n_frac > args.max_n_fraction:
+                n_segments_skipped_n += 1
+                continue
+
+            win_len = win_end - win_start
+            if pending and (win_len != pending_len or len(pending) >= args.batch_size):
+                _flush_batch(pending)
+                pending = []
+            pending_len = win_len
+            pending.append((chrom, seg_start, seg_end, win_start, win_end, win_seq))
+
+    _flush_batch(pending)
+
+    if open_iv is not None:
+        open_iv["confidence"] = open_iv["prob_sum"] / open_iv["prob_n"]
+        del open_iv["prob_sum"], open_iv["prob_n"]
+        intervals.append(open_iv)
+
+    n_kept = n_segments_total - n_segments_skipped_n
+    _log(f"{n_segments_total:,} segments total | {n_kept:,} kept | "
+         f"{n_segments_skipped_n:,} skipped (N content)")
+
+    if not intervals:
+        print("ERROR: no segments passed the N-content filter. Check your FASTA.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    _log("Prediction distribution (per-base): " +
+         " | ".join(f"{k}: {v:,}" for k, v in sorted(label_counts.items())))
+
+    write_bed_intervals(intervals, outdir / f"{prefix}.bed")
+
+    emissions_kg = _stop_tracker(tracker)
+    if emissions_kg is not None:
+        _log(f"Carbon footprint: {emissions_kg:.6f} kg CO2 equivalent")
+
+    elapsed_s   = time.monotonic() - t_start
+    peak_mem_mb = _peak_mem_mb()
+    _log(f"Wall-clock time   : {elapsed_s:.1f} s ({elapsed_s/60:.1f} min)")
+    _log(f"Peak memory (RSS) : {peak_mem_mb:.1f} MB")
+
+    summary = {
+        "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": VERSION,
+        "input_fasta": str(fasta_path),
+        "n_segments_total": n_segments_total,
+        "n_segments_kept":  n_kept,
+        "n_segments_skipped_n": n_segments_skipped_n,
+        "n_bed_intervals": len(intervals),
+        "parameters": {
+            "window_size": args.window_size, "overlap": args.overlap,
+            "max_n_fraction": args.max_n_fraction, "batch_size": args.batch_size,
+            "device": str(device),
+        },
+        "resource_usage": {
+            "wall_clock_s":       round(elapsed_s, 1),
+            "peak_mem_mb":        round(peak_mem_mb, 1),
+            "emissions_kg_CO2eq": emissions_kg,
+        },
+    }
+    _write_summary(outdir, summary)
+    _close_log()
+
+
 def resolve_predict_backbone(model_dir: Path, cli_backbone, cli_backbone_model) -> tuple:
     """model_config.json (written by train_classifier from the embeddings'
     own recorded provenance) is the authoritative source of truth for which
@@ -2701,6 +2970,56 @@ def _build_parser() -> argparse.ArgumentParser:
     opt.add_argument("--disable_co2_tracking", action="store_true",
                      help="Disable carbon footprint tracking")
 
+    # ── predict_dense_cnn (v2: end-to-end, no pretrained backbone) ──────────────
+    pdc = sub.add_parser("predict_dense_cnn",
+                         help="v2: dilated-CNN+CRF forward pass + Viterbi "
+                              "decode over a new genome at true 1bp "
+                              "resolution, streaming run-length-encoded "
+                              "into BED intervals -- no embedding step")
+    req = pdc.add_argument_group("required")
+    req.add_argument("--fasta", required=True, type=Path, metavar="FASTA",
+                     help="Input genome FASTA (uncompressed or bgzipped)")
+    req.add_argument("--model_dir", required=True, type=Path, metavar="DIR",
+                     help="Directory with classifier.pt, label_encoder.json, "
+                          "model_config.json from train_dense_cnn")
+    req.add_argument("--outdir", required=True, type=Path, metavar="DIR",
+                     help="Output directory for the predicted BED")
+    opt = pdc.add_argument_group("optional")
+    opt.add_argument("--prefix", default=None, metavar="STR",
+                     help="Output filename prefix (default: FASTA filename stem)")
+    opt.add_argument("--window_size", type=int, default=5000, metavar="BP",
+                     help="Inference window size in bp (default: 5000, "
+                          "matching prepare_dataset's default --chunk_size). "
+                          "The v2 architecture plan's genome-scale target was "
+                          "24kb windows, but the CRF's forward/decode are "
+                          "sequential Python loops over sequence length -- "
+                          "defaulting to 5000 (already smaller than the "
+                          "model's own ~12kb receptive field at the default "
+                          "--n_cycles 3, so little context is actually lost) "
+                          "keeps predict practical until that loop is "
+                          "optimized (windowed/chunked Viterbi). Increase "
+                          "once benchmarked.")
+    opt.add_argument("--overlap", type=int, default=500, metavar="BP",
+                     help="Context overlap between adjacent inference "
+                          "windows in bp, trimmed from each window's edges "
+                          "before merging (default: 500). Must be smaller "
+                          "than --window_size.")
+    opt.add_argument("--max_n_fraction", type=float, default=0.1, metavar="F",
+                     help="Windows above this N fraction are skipped (default: 0.1)")
+    opt.add_argument("--batch_size", type=int, default=16, metavar="N",
+                     help="Forward-pass batch size (default: 16). Windows "
+                          "are batched only with other windows of identical "
+                          "length (true for every window in a chromosome "
+                          "except its last) -- batching amortizes the CRF's "
+                          "sequential decode cost across the batch, not "
+                          "just the model's own compute.")
+    opt.add_argument("--device", default=None, metavar="DEV",
+                     help="'cuda', 'mps', or 'cpu'. Auto-detected if omitted.")
+    opt.add_argument("--dry_run", action="store_true",
+                     help="Validate inputs and print planned steps, then exit")
+    opt.add_argument("--disable_co2_tracking", action="store_true",
+                     help="Disable carbon footprint tracking")
+
     # ── compare_te_annotation ────────────────────────────────────────────────
     cp = sub.add_parser("compare_te_annotation",
                         help="Benchmark predictions against a reference BED annotation")
@@ -2741,6 +3060,8 @@ def main() -> None:
         run_train_dense_cnn(args)
     elif args.command == "predict":
         run_predict(args)
+    elif args.command == "predict_dense_cnn":
+        run_predict_dense_cnn(args)
     elif args.command == "compare_te_annotation":
         run_compare_te_annotation(args)
 
