@@ -52,7 +52,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.5.0"
+VERSION = "v0.6.0"
 
 import argparse
 import getpass
@@ -388,6 +388,68 @@ def label_bins(windows: list, bin_size: int, chunk_size: int,
     return window_bin_labels, n_bins
 
 
+def _paint_chrom_labels(chrom_len: int, repeats_chrom: pd.DataFrame,
+                        genes_chrom, label_to_idx: dict) -> np.ndarray:
+    """Rasterize repeat + gene intervals for one chromosome into a per-base
+    int8 label array via vectorized slice-assignment. label_bins()'s
+    bedtools per-bin-row intersect needs one row per bin -- at bin_size=1
+    that's one row per base (a single 5000bp window alone would need 5000
+    rows; genome-wide, billions), so this paints directly into a numpy
+    array instead. Precedence matches the project convention used
+    elsewhere (repeat > genic > intergenic, see assign_reference_labels()):
+    genes are painted first, then repeats overwrite them. Overlapping
+    repeat intervals resolve by BED file order (last write wins) -- a
+    reasonable approximation given real repeat annotations rarely have
+    deeply nested overlaps at the same base."""
+    intergenic_idx = label_to_idx["Intergenic"]
+    labels = np.full(chrom_len, intergenic_idx, dtype=np.int8)
+
+    if genes_chrom is not None and len(genes_chrom):
+        genic_idx = label_to_idx["Genic"]
+        for s, e in zip(genes_chrom["start"].to_numpy(), genes_chrom["end"].to_numpy()):
+            labels[max(0, s):min(chrom_len, e)] = genic_idx
+
+    for s, e, lbl in zip(repeats_chrom["start"].to_numpy(),
+                         repeats_chrom["end"].to_numpy(),
+                         repeats_chrom["label"].to_numpy()):
+        labels[max(0, s):min(chrom_len, e)] = label_to_idx[lbl]
+
+    return labels
+
+
+def label_bases_dense(windows: list, repeats_df: pd.DataFrame, genes_df,
+                      labels: list) -> dict:
+    """Per-base (bin_size=1) labeling: paint each chromosome once into a
+    dense int8 label array, then slice out each window's bases from it --
+    replaces label_bins()'s per-bin bedtools intersect, which does not
+    scale to 1bp resolution (see _paint_chrom_labels docstring). Processes
+    one chromosome at a time and copies out each window's slice before
+    discarding the full painted array, so memory is bounded by one
+    chromosome at a time rather than the whole genome. Returns
+    {(chrom, start, end): np.ndarray(int8)}."""
+    label_to_idx = {lbl: i for i, lbl in enumerate(labels)}
+
+    windows_by_chrom: dict = {}
+    for w in windows:
+        windows_by_chrom.setdefault(w[0], []).append(w)
+
+    rep_groups  = {c: g for c, g in repeats_df.groupby("chrom")}
+    gene_groups = {c: g for c, g in genes_df.groupby("chrom")} if genes_df is not None else {}
+
+    window_base_labels = {}
+    for chrom, chrom_windows in windows_by_chrom.items():
+        chrom_len = max(w[2] for w in chrom_windows)
+        rep_chrom   = rep_groups.get(chrom, repeats_df.iloc[0:0])
+        genes_chrom = gene_groups.get(chrom) if genes_df is not None else None
+        painted = _paint_chrom_labels(chrom_len, rep_chrom, genes_chrom, label_to_idx)
+        for w in chrom_windows:
+            _, start, end = w
+            window_base_labels[w] = painted[start:end].copy()
+        del painted
+
+    return window_base_labels
+
+
 def process_species_prepare(species_id: str, fasta_path: str, bed_path: str,
                             gff3_path, chunk_size: int, stride: int,
                             bin_size: int, max_n_fraction: float,
@@ -420,9 +482,26 @@ def process_species_prepare(species_id: str, fasta_path: str, bed_path: str,
 
     _check_chroms(species_id, fasta, repeats_df, genes_df)
 
-    _log(f"{species_id}: labeling bins (bin_size={bin_size})")
-    window_bin_labels, n_bins = label_bins(windows, bin_size, chunk_size,
-                                           repeats_df, genes_df)
+    dense_1bp = (bin_size == 1)
+    if dense_1bp:
+        # True single-nucleotide labeling for the v2 end-to-end dense CNN
+        # path (see docs/plans/agile-chasing-willow.md) -- fixed label
+        # vocabulary (DEFAULT_LABELS) encoded as int8, stored as raw bytes
+        # (base_labels_bytes) rather than a Python list of label strings:
+        # a naive list<str> column at 1bp resolution would need one string
+        # object per base per window (e.g. 5000 per window), which is the
+        # same class of Python-object-boxing memory blowup already fixed
+        # once this session for embeddings (see embedding_bytes).
+        _log(f"{species_id}: labeling bases (bin_size=1, dense per-chromosome painting)")
+        label_to_idx = {lbl: i for i, lbl in enumerate(DEFAULT_LABELS)}
+        window_base_labels = label_bases_dense(windows, repeats_df, genes_df, DEFAULT_LABELS)
+        n_bins = chunk_size
+        genic_idx, intergenic_idx = label_to_idx["Genic"], label_to_idx["Intergenic"]
+        bincount_total = np.zeros(len(DEFAULT_LABELS), dtype=np.int64)
+    else:
+        _log(f"{species_id}: labeling bins (bin_size={bin_size})")
+        window_bin_labels, n_bins = label_bins(windows, bin_size, chunk_size,
+                                               repeats_df, genes_df)
 
     _log(f"{species_id}: extracting sequences")
     records = []
@@ -434,28 +513,50 @@ def process_species_prepare(species_id: str, fasta_path: str, bed_path: str,
         if n_frac > max_n_fraction:
             skipped_n += 1
             continue
-        bin_labels = window_bin_labels[tuple(win)]
-        repeat_fraction = sum(1 for l in bin_labels if l not in ("Genic", "Intergenic")) / n_bins
-        records.append({
-            "species":         species_id,
-            "chrom":           chrom,
-            "start":           start,
-            "end":             end,
-            "sequence":        seq,
-            "bin_labels":      bin_labels,
-            "n_bins":          n_bins,
-            "bin_size":        bin_size,
-            "repeat_fraction": round(repeat_fraction, 4),
-        })
+
+        if dense_1bp:
+            base_labels = window_base_labels[win]
+            non_context = (base_labels != genic_idx) & (base_labels != intergenic_idx)
+            repeat_fraction = float(non_context.mean())
+            bincount_total += np.bincount(base_labels, minlength=len(DEFAULT_LABELS))
+            records.append({
+                "species":           species_id,
+                "chrom":             chrom,
+                "start":             start,
+                "end":               end,
+                "sequence":          seq,
+                "base_labels_bytes": base_labels.astype(np.int8).tobytes(),
+                "n_bins":            n_bins,
+                "bin_size":          bin_size,
+                "repeat_fraction":   round(repeat_fraction, 4),
+            })
+        else:
+            bin_labels = window_bin_labels[tuple(win)]
+            repeat_fraction = sum(1 for l in bin_labels if l not in ("Genic", "Intergenic")) / n_bins
+            records.append({
+                "species":         species_id,
+                "chrom":           chrom,
+                "start":           start,
+                "end":             end,
+                "sequence":        seq,
+                "bin_labels":      bin_labels,
+                "n_bins":          n_bins,
+                "bin_size":        bin_size,
+                "repeat_fraction": round(repeat_fraction, 4),
+            })
 
     _log(f"{species_id}: {len(records):,} chunks kept | "
          f"{skipped_n:,} skipped (N content)")
 
     df = pd.DataFrame(records)
     if len(df):
-        all_bin_labels = [l for row in df["bin_labels"] for l in row]
-        dist = Counter(all_bin_labels)
-        _log(f"{species_id}: bin label distribution — {dict(dist)}")
+        if dense_1bp:
+            dist = {lbl: int(c) for lbl, c in zip(DEFAULT_LABELS, bincount_total)}
+            _log(f"{species_id}: base label distribution — {dist}")
+        else:
+            all_bin_labels = [l for row in df["bin_labels"] for l in row]
+            dist = Counter(all_bin_labels)
+            _log(f"{species_id}: bin label distribution — {dict(dist)}")
         df = df.sort_values(["chrom", "start"]).reset_index(drop=True)
 
     df.to_parquet(out_path, index=False)
@@ -2020,7 +2121,15 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="Window size in bp (default: 5000)")
     opt.add_argument("--bin_size", type=int, default=50, metavar="BP",
                      help="Per-bin label/embedding resolution in bp; must "
-                          "evenly divide --chunk_size (default: 50)")
+                          "evenly divide --chunk_size (default: 50). "
+                          "--bin_size 1 switches to true single-nucleotide "
+                          "labeling for the v2 end-to-end dense CNN "
+                          "architecture: labels are painted directly per "
+                          "chromosome (not via bedtools, which does not "
+                          "scale to 1bp resolution) and stored as compact "
+                          "int8 bytes (base_labels_bytes) instead of the "
+                          "legacy bin_labels string-list column, using the "
+                          "fixed DEFAULT_LABELS vocabulary.")
     opt.add_argument("--overlap", type=float, default=0.5, metavar="F",
                      help="Fractional overlap between windows (default: 0.5)")
     opt.add_argument("--max_n_fraction", type=float, default=0.1, metavar="F",

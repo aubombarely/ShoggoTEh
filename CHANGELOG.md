@@ -5,6 +5,39 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.6.0] — 2026-07-26
+
+### Added
+
+- **`prepare_dataset --bin_size 1`: true single-nucleotide labeling**, the
+  first step of the v2 architecture redesign (see
+  `.claude/plans/agile-chasing-willow.md`) — an end-to-end dense CNN+CRF
+  trained directly on raw nucleotide sequence, no pretrained backbone, no
+  `generate_embeddings` step. `label_bins()`'s bedtools-per-bin-row
+  intersect does not scale to 1bp resolution (a single 5000bp window alone
+  would need 5000 intersect rows; genome-wide, billions), so a new
+  `bin_size == 1` path was added instead: `_paint_chrom_labels()` /
+  `label_bases_dense()` rasterize repeat + gene intervals directly into a
+  per-chromosome `int8` numpy array via vectorized slice-assignment
+  (repeat > genic > intergenic precedence, matching
+  `assign_reference_labels()`), processing one chromosome at a time so
+  memory is bounded rather than holding the whole genome painted at once.
+  Labels are stored as raw `int8` bytes (`base_labels_bytes`, using the
+  fixed `DEFAULT_LABELS` vocabulary) rather than a Python list of label
+  strings — a naive `list<str>` column at 1bp resolution would need one
+  string object per base per window, the same class of Python-object-
+  boxing memory blowup already fixed once this session for embeddings
+  (`embedding_bytes`, v0.3.1). The legacy `bin_size > 1` path
+  (`label_bins()`, bedtools-based) is unchanged. Verified against real
+  `process_species_prepare()` runs on synthetic data: exact base-pair
+  boundary correctness (no off-by-one at interval edges), correct
+  repeat-over-gene precedence at overlapping positions, and performance
+  (~10,850 chunks/s on a 2Mb synthetic genome with 1,096 repeat intervals,
+  extrapolating to ~80s genome-wide versus the ~11.8h/genome the eliminated
+  `generate_embeddings` step took).
+
+---
+
 ## [v0.5.0] — 2026-07-26
 
 ### Added
