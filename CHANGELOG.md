@@ -5,6 +5,35 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.5.0] — 2026-07-26
+
+### Added
+
+- **`train_classifier` gains `--balanced_corpus` / `--target_bins_per_class`**
+  — a quota-capped, multi-genome chunk-selection mode addressing the real
+  root cause found on the Zea_mays pilot: SINE recall was 0.000 in
+  validation not because loss weighting was insufficient, but because a
+  single species only had 5,955 SINE bins total to learn from in the first
+  place. `load_dense_embeddings` already pools every species' Parquet file
+  under `--embeddings_dir` — this mode selects a balanced training subset
+  from that full multi-genome pool: process classes rarest-first (by
+  corpus-wide bin count) and pull in whole chunks containing that class
+  until its cumulative bin count reaches `--target_bins_per_class` (default
+  20,000; classes with less data available across the whole corpus fall
+  short by construction, logged per class with a `[data-limited]` flag).
+  Selection operates on **whole chunks**, not individual bins — the CRF
+  needs contiguous bin runs to learn transition structure, so cherry-picking
+  isolated bins across the genome would destroy exactly the sequence
+  context it depends on. Off by default (opt-in); combine with the existing
+  `--class_weight balanced` for both exposure- and loss-level correction.
+  `balanced_corpus`/`target_bins_per_class` are recorded in
+  `run_summary.json`'s `parameters` block for provenance. Verified via a
+  synthetic unit test: rarest-class selection exhausts all available bins
+  when scarcer than the target, and the returned achieved-bin-counts match
+  an independent recount of the selected subset exactly.
+
+---
+
 ## [v0.4.1] — 2026-07-26
 
 ### Fixed

@@ -52,7 +52,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.4.1"
+VERSION = "v0.5.0"
 
 import argparse
 import getpass
@@ -1127,6 +1127,54 @@ def load_dense_embeddings(embeddings_dir: Path, labels: list) -> tuple:
     return X, y, n_bins, hidden_dim, backbone, backbone_model
 
 
+def _select_balanced_chunks(y: np.ndarray, n_classes: int, target_per_class: int,
+                            seed: int) -> tuple:
+    """Greedy, multi-genome chunk selection for a balanced training corpus.
+
+    Whole chunks (not individual bins) are the atomic selection unit -- the
+    CRF needs contiguous bin runs to learn transition structure, so
+    cherry-picking individual bins across the genome would destroy exactly
+    the sequence context it depends on. Classes are processed rarest-first
+    (by total corpus-wide bin count) so scarce classes get first claim on
+    the chunks that contain them; a class's cumulative *bin* coverage (not
+    chunk count) is compared against target_per_class, since one chunk
+    typically contributes to several classes at once (its own gold labels
+    are still whatever they are -- selection doesn't relabel anything).
+    Candidate order is shuffled with `seed`, so chunks from every genome in
+    the pooled corpus (load_dense_embeddings already concatenates all
+    species' Parquet files) mix freely with no per-genome preference.
+
+    Returns (selected_indices, achieved_bin_counts) where achieved_bin_counts
+    is the actual per-class bin count in the selected subset -- classes with
+    fewer than target_per_class total bins in the whole corpus will fall
+    short of the target by construction; the caller should log this."""
+    rng = np.random.default_rng(seed)
+    n_chunks = y.shape[0]
+
+    chunk_class_counts = np.zeros((n_chunks, n_classes), dtype=np.int64)
+    for c in range(n_classes):
+        chunk_class_counts[:, c] = (y == c).sum(axis=1)
+
+    total_per_class = chunk_class_counts.sum(axis=0)
+    class_order = np.argsort(total_per_class)  # rarest first
+
+    selected = np.zeros(n_chunks, dtype=bool)
+    covered_bins = np.zeros(n_classes, dtype=np.int64)
+
+    for c in class_order:
+        if covered_bins[c] >= target_per_class:
+            continue
+        candidates = np.where((chunk_class_counts[:, c] > 0) & (~selected))[0]
+        rng.shuffle(candidates)
+        for idx in candidates:
+            if covered_bins[c] >= target_per_class:
+                break
+            selected[idx] = True
+            covered_bins += chunk_class_counts[idx]
+
+    return np.where(selected)[0], covered_bins
+
+
 def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
                 epochs: int, lr: float, patience: int, outdir: Path,
                 class_weights) -> list:
@@ -1229,6 +1277,9 @@ def run_train_classifier(args) -> None:
         _log(f"  val_fraction   : {args.val_fraction}")
         _log(f"  patience       : {args.patience}")
         _log(f"  class_weight   : {args.class_weight}")
+        _log(f"  balanced_corpus: {args.balanced_corpus}")
+        if args.balanced_corpus:
+            _log(f"  target_bins_per_class: {args.target_bins_per_class}")
         _log(f"  labels         : {args.labels}")
         _log("  Steps that would run: load per-bin embeddings -> train "
              "CNN+CRF sequence labeler -> evaluate -> save model")
@@ -1253,6 +1304,17 @@ def run_train_classifier(args) -> None:
         embeddings_dir, args.labels)
     _log(f"Loaded {X.shape[0]:,} chunks | n_bins={n_bins} | hidden_dim={hidden_dim} | "
          f"backbone={backbone} | backbone_model={backbone_model}")
+
+    if args.balanced_corpus:
+        _log(f"Building balanced multi-genome corpus (target: "
+             f"{args.target_bins_per_class:,} bins/class, rarest-first chunk selection) ...")
+        sel_idx, achieved = _select_balanced_chunks(
+            y, len(args.labels), args.target_bins_per_class, args.seed)
+        _log(f"Selected {len(sel_idx):,} / {X.shape[0]:,} chunks")
+        for lbl, n_achieved in zip(args.labels, achieved):
+            flag = "" if n_achieved >= args.target_bins_per_class else "  [data-limited]"
+            _log(f"    {lbl:15s} {int(n_achieved):>10,} / {args.target_bins_per_class:,} bins{flag}")
+        X, y = X[sel_idx], y[sel_idx]
 
     # Stratify the chunk-level split by each chunk's dominant bin label
     # (a per-chunk proxy — the classifier itself trains at bin resolution).
@@ -1380,6 +1442,8 @@ def run_train_classifier(args) -> None:
             "cnn_channels": args.cnn_channels, "kernel_size": args.kernel_size,
             "dropout": args.dropout, "val_fraction": args.val_fraction,
             "patience": args.patience, "class_weight": args.class_weight,
+            "balanced_corpus": args.balanced_corpus,
+            "target_bins_per_class": args.target_bins_per_class if args.balanced_corpus else None,
             "seed": args.seed,
         },
         "resource_usage": {
@@ -2033,6 +2097,22 @@ def _build_parser() -> argparse.ArgumentParser:
                           "NLL by inverse per-bin training-set class frequency "
                           "(mean weight of the gold bin tags in that sequence), "
                           "so rare TE classes are not drowned out. 'none' disables it.")
+    opt.add_argument("--balanced_corpus", action="store_true",
+                     help="Build the training set via quota-capped, multi-genome "
+                          "chunk selection instead of using every pooled chunk: "
+                          "process classes rarest-first and pull in whole chunks "
+                          "(any species in --embeddings_dir) containing that "
+                          "class until its cumulative bin count reaches "
+                          "--target_bins_per_class. Fixes rare-class scarcity by "
+                          "exposure (more real examples, pooled across all "
+                          "genomes) rather than only reweighting the loss. Off "
+                          "by default; combine with --class_weight balanced.")
+    opt.add_argument("--target_bins_per_class", type=int, default=20000, metavar="N",
+                     help="Target per-class bin count for --balanced_corpus "
+                          "(default: 20000). Classes with fewer bins available "
+                          "in the whole pooled corpus fall short of this target "
+                          "by construction -- the actual achieved count is "
+                          "logged per class. Ignored unless --balanced_corpus.")
     opt.add_argument("--seed", type=int, default=42, metavar="N",
                      help="Random seed (default: 42)")
     opt.add_argument("--device", default=None, metavar="DEV",

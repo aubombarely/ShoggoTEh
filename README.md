@@ -181,6 +181,8 @@ python3 scripts/ShoggoTEh.py train_classifier \
 | `--val_fraction` | `0.2` | Fraction of chunks held out for validation (stratified by each chunk's dominant bin label) |
 | `--patience` | `10` | Early-stopping patience in epochs |
 | `--class_weight` | `balanced` | `balanced` reweights the CRF's per-sequence NLL by inverse **per-bin** training-set class frequency (ported from the old per-window frequency); `none` disables it |
+| `--balanced_corpus` | off | Build the training set via quota-capped, multi-genome chunk selection (rarest class first) instead of using every pooled chunk — fixes rare-class scarcity by exposure, not just loss weighting. Selection operates on whole chunks, never individual bins, so the CRF's sequence context is preserved |
+| `--target_bins_per_class` | `20000` | Target per-class bin count for `--balanced_corpus`; classes with fewer bins available across the whole pooled corpus fall short by construction (logged per class) |
 | `--seed` | `42` | Random seed |
 | `--device` | auto | `cuda`, `mps`, or `cpu` |
 | `--dry_run` | off | Validate inputs, print steps, exit without running |
