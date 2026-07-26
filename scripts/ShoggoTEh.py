@@ -52,7 +52,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.3.2"
+VERSION = "v0.4.0"
 
 import argparse
 import getpass
@@ -567,10 +567,11 @@ def run_prepare_dataset(args) -> None:
 # generate_embeddings
 ###############################################################################
 
-def load_hyena_model(model_name: str, device):
-    import torch
+def load_hyena_backbone(model_name: str, device):
+    """AutoModel/AutoTokenizer, single-nucleotide tokenization (1 token/bp)
+    plus a trailing EOS token. Hidden states via out.last_hidden_state."""
     from transformers import AutoModel, AutoTokenizer
-    _log(f"Loading tokenizer and model: {model_name}")
+    _log(f"Loading tokenizer and model (hyena): {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
     model.eval()
@@ -580,27 +581,165 @@ def load_hyena_model(model_name: str, device):
     return tokenizer, model
 
 
-def embed_sequences_dense(sequences: list, n_bins: int, bin_size: int,
-                          tokenizer, model, device, batch_size: int) -> list:
-    """
-    Run sequences through Hyena-DNA (frozen) and pool per-nucleotide hidden
-    states into per-bin embeddings. Returns a list of np.ndarray, each of
-    shape (n_bins, hidden_dim), one per input sequence.
+def load_nucleotide_transformer_backbone(model_name: str, device):
+    """Standard AutoModel/AutoTokenizer, 6-mer tokenization (each token =
+    6bp, with standalone single-nucleotide fallback tokens for
+    non-multiple-of-6 remainders) plus a leading CLS token. Hidden states
+    via out.last_hidden_state (same pattern as Hyena-DNA)."""
+    from transformers import AutoModel, AutoTokenizer
+    _log(f"Loading tokenizer and model (nucleotide_transformer): {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    model.eval()
+    model.to(device)
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    _log(f"Model ready on {device} ({n_params:.1f}M parameters)")
+    return tokenizer, model
 
-    Tokenizer footnote: HyenaDNA's tokenizer appends a trailing EOS/SEP
-    token by default (seq_len + 1 tokens). That trailing special-token
-    position is dropped before bin-pooling so bin boundaries map correctly
-    back to genomic coordinates (see plan's "Tokenizer footnote").
+
+def load_plantcaduceus_backbone(model_name: str, device):
+    """AutoModelForMaskedLM (NOT plain AutoModel) + AutoTokenizer, both with
+    trust_remote_code=True. Hidden states are NOT exposed via
+    .last_hidden_state on this wrapper -- must call with
+    output_hidden_states=True and read out.hidden_states[-1] instead.
+    Tokenization scheme (single-nucleotide vs k-mer) is handled generically
+    by the dynamic tokens-per-bp logic in embed_sequences_dense(), not
+    assumed here."""
+    from transformers import AutoModelForMaskedLM, AutoTokenizer
+    _log(f"Loading tokenizer and model (plantcaduceus): {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForMaskedLM.from_pretrained(model_name, trust_remote_code=True)
+    model.eval()
+    model.to(device)
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    _log(f"Model ready on {device} ({n_params:.1f}M parameters)")
+    return tokenizer, model
+
+
+def _extract_last_hidden_state(out):
+    return out.last_hidden_state
+
+
+def _extract_last_layer_hidden_states(out):
+    return out.hidden_states[-1]
+
+
+# Backbone registry: name -> {default_model, load_fn, hidden_state_fn,
+# forward_kwargs}. To add a 4th backbone: write a load_<name>_backbone(name,
+# device) -> (tokenizer, model) function, pick the right hidden_state_fn
+# (out.last_hidden_state for a plain AutoModel, or
+# _extract_last_layer_hidden_states + forward_kwargs={"output_hidden_states":
+# True} for an AutoModelForMaskedLM-style wrapper), and add one entry below.
+# embed_sequences_dense() needs no per-backbone changes -- tokens-per-bp is
+# always computed dynamically at runtime, never hardcoded per backbone.
+BACKBONE_REGISTRY = {
+    "hyena": {
+        "default_model":   "LongSafari/hyenadna-medium-160k-seqlen-hf",
+        "load_fn":         load_hyena_backbone,
+        "hidden_state_fn": _extract_last_hidden_state,
+        "forward_kwargs":  {},
+    },
+    "nucleotide_transformer": {
+        "default_model":   "InstaDeepAI/nucleotide-transformer-v2-50m-multi-species",
+        "load_fn":         load_nucleotide_transformer_backbone,
+        "hidden_state_fn": _extract_last_hidden_state,
+        "forward_kwargs":  {},
+    },
+    "plantcaduceus": {
+        "default_model":   "kuleshov-group/PlantCaduceus_l20",
+        "load_fn":         load_plantcaduceus_backbone,
+        "hidden_state_fn": _extract_last_layer_hidden_states,
+        "forward_kwargs":  {"output_hidden_states": True},
+    },
+}
+
+
+def resolve_backbone(backbone: str, backbone_model) -> tuple:
+    """Resolve a --backbone name + optional --backbone_model override into
+    (backbone, model_name), validating the backbone name and falling back
+    to that backbone's own sensible default checkpoint when no override is
+    given."""
+    if backbone not in BACKBONE_REGISTRY:
+        print(f"ERROR: unknown --backbone '{backbone}'. Choices: "
+              f"{sorted(BACKBONE_REGISTRY)}", file=sys.stderr)
+        sys.exit(1)
+    model_name = backbone_model or BACKBONE_REGISTRY[backbone]["default_model"]
+    return backbone, model_name
+
+
+def load_backbone(backbone: str, model_name: str, device):
+    entry = BACKBONE_REGISTRY[backbone]
+    return entry["load_fn"](model_name, device)
+
+
+def _pool_bins_from_hidden(content_hidden, n_bins: int, bin_size: int,
+                           tokens_per_bp: float):
+    """Mean-pool a (content_length, D) slice of hidden states into
+    (n_bins, D) using a dynamically-computed tokens_per_bp ratio (rather
+    than a hardcoded per-backbone token/bp assumption). Bin token
+    boundaries are recomputed from scratch at each bin edge
+    (round(i * bin_size * tokens_per_bp)) instead of accumulating a fixed
+    per-bin token count, so rounding error cannot drift across bins. The
+    last bin absorbs any remainder up to the actual content length. Bins
+    that end up with zero tokens (e.g. a short trailing chunk under a
+    high-tokens-per-bp backbone) fall back to the previous bin's pooled
+    vector, or an all-zero vector for the very first bin."""
+    import torch
+
+    total_tokens = content_hidden.shape[0]
+    hidden_dim   = content_hidden.shape[1]
+    pooled = torch.zeros(n_bins, hidden_dim, dtype=content_hidden.dtype,
+                         device=content_hidden.device)
+
+    prev_end = 0
+    for i in range(n_bins):
+        end_tok = min(round((i + 1) * bin_size * tokens_per_bp), total_tokens)
+        start_tok = min(prev_end, total_tokens)
+        if end_tok > start_tok:
+            pooled[i] = content_hidden[start_tok:end_tok].mean(dim=0)
+        elif i > 0:
+            pooled[i] = pooled[i - 1]
+        # else: leave as zeros (no tokens at all for this sequence's first bin)
+        prev_end = end_tok
+
+    return pooled
+
+
+def embed_sequences_dense(sequences: list, n_bins: int, bin_size: int,
+                          tokenizer, model, device, batch_size: int,
+                          hidden_state_fn=_extract_last_hidden_state,
+                          forward_kwargs: dict = None) -> list:
+    """
+    Run sequences through a frozen embedding backbone and pool the
+    per-token hidden states into per-bin embeddings. Returns a list of
+    np.ndarray, each of shape (n_bins, hidden_dim), one per input sequence.
+
+    Generalises the original Hyena-DNA-only implementation (1 token/bp +
+    trailing EOS) to any tokenization scheme: the effective tokens-per-bp
+    ratio is computed dynamically per sequence as
+    valid_content_token_len / len(raw_sequence_bp), after generically
+    dropping whichever of CLS/BOS (leading) and EOS/SEP (trailing) special
+    tokens the tokenizer added (checked via tokenizer.cls_token_id /
+    bos_token_id / eos_token_id / sep_token_id, not hardcoded to
+    EOS-only). Bin pooling then uses bin_size * tokens_per_bp tokens per
+    bin (see _pool_bins_from_hidden). For Hyena-DNA (no CLS, 1 token/bp,
+    trailing EOS) this reduces to the original reshape-into-bins behaviour.
     """
     import torch
 
-    eos_id = getattr(tokenizer, "eos_token_id", None)
-    if eos_id is None:
-        eos_id = getattr(tokenizer, "sep_token_id", None)
+    forward_kwargs = forward_kwargs or {}
+
+    cls_id = getattr(tokenizer, "cls_token_id", None)
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    special_ids = {
+        cls_id, bos_id,
+        getattr(tokenizer, "eos_token_id", None),
+        getattr(tokenizer, "sep_token_id", None),
+    }
+    special_ids.discard(None)
 
     results = []
     n = len(sequences)
-    need = n_bins * bin_size
 
     for batch_start in range(0, n, batch_size):
         batch_seqs = sequences[batch_start: batch_start + batch_size]
@@ -608,22 +747,25 @@ def embed_sequences_dense(sequences: list, n_bins: int, bin_size: int,
         enc = {k: v.to(device) for k, v in enc.items()}
 
         with torch.no_grad():
-            out = model(**enc)
-        hidden = out.last_hidden_state  # (B, L, D)
+            out = model(**enc, **forward_kwargs)
+        hidden = hidden_state_fn(out)  # (B, L, D)
         attn = enc.get("attention_mask")
+        input_ids = enc["input_ids"]
 
         for i in range(len(batch_seqs)):
             valid_len = int(attn[i].sum().item()) if attn is not None else hidden.shape[1]
-            seq_len_nt = valid_len - 1 if eos_id is not None else valid_len
-            seq_hidden = hidden[i, :seq_len_nt, :]
+            ids_row = input_ids[i][:valid_len].tolist()
 
-            if seq_hidden.shape[0] < need:
-                pad = need - seq_hidden.shape[0]
-                seq_hidden = torch.nn.functional.pad(seq_hidden, (0, 0, 0, pad))
-            else:
-                seq_hidden = seq_hidden[:need]
+            n_special = sum(1 for tid in ids_row if tid in special_ids)
+            leading_offset = 1 if (ids_row and ids_row[0] in (cls_id, bos_id)
+                                   and ids_row[0] is not None) else 0
+            content_len = max(valid_len - n_special, 0)
 
-            pooled = seq_hidden.reshape(n_bins, bin_size, -1).mean(dim=1)  # (n_bins, D)
+            raw_len = len(batch_seqs[i])
+            tokens_per_bp = content_len / raw_len if raw_len > 0 else 0.0
+
+            content_hidden = hidden[i, leading_offset: leading_offset + content_len, :]
+            pooled = _pool_bins_from_hidden(content_hidden, n_bins, bin_size, tokens_per_bp)
             results.append(pooled.cpu().float().numpy())
 
         done = min(batch_start + batch_size, n)
@@ -634,7 +776,10 @@ def embed_sequences_dense(sequences: list, n_bins: int, bin_size: int,
 
 
 def process_species_embed(chunks_path: Path, outdir: Path, tokenizer, model,
-                          device, bin_size: int, batch_size: int, force: bool) -> int:
+                          device, bin_size: int, batch_size: int,
+                          backbone: str, backbone_model: str,
+                          hidden_state_fn, forward_kwargs: dict,
+                          force: bool) -> int:
     species_id = chunks_path.stem
     out_path   = outdir / f"{species_id}.parquet"
     if _checkpoint(out_path, f"generate_embeddings:{species_id}", force):
@@ -657,9 +802,12 @@ def process_species_embed(chunks_path: Path, outdir: Path, tokenizer, model,
 
     sequences = df["sequence"].tolist()
     _log(f"{species_id}: generating dense per-bin embeddings "
-         f"(n_bins={n_bins}, bin_size={bin_size}, batch_size={batch_size})")
+         f"(backbone={backbone}, model={backbone_model}, n_bins={n_bins}, "
+         f"bin_size={bin_size}, batch_size={batch_size})")
     pooled_list = embed_sequences_dense(sequences, n_bins, bin_size,
-                                        tokenizer, model, device, batch_size)
+                                        tokenizer, model, device, batch_size,
+                                        hidden_state_fn=hidden_state_fn,
+                                        forward_kwargs=forward_kwargs)
     hidden_dim = pooled_list[0].shape[1]
     _log(f"{species_id}: hidden dim = {hidden_dim}")
 
@@ -672,6 +820,12 @@ def process_species_embed(chunks_path: Path, outdir: Path, tokenizer, model,
     # per-element overhead.
     df["embedding_bytes"] = [p.astype(np.float32).tobytes() for p in pooled_list]
     df["hidden_dim"] = hidden_dim
+    # Record which backbone + exact checkpoint produced these embeddings so
+    # train_classifier/predict can detect a mixed-backbone corpus or a
+    # stale --backbone flag instead of silently mixing incompatible
+    # embedding spaces (see model_config.json backbone-mismatch handling).
+    df["backbone"] = backbone
+    df["backbone_model"] = backbone_model
 
     df.to_parquet(out_path, index=False)
     _log(f"{species_id}: written to {out_path}")
@@ -694,14 +848,17 @@ def run_generate_embeddings(args) -> None:
         sys.exit(1)
     _log(f"Found {len(chunk_files)} species to embed: {[f.stem for f in chunk_files]}")
 
+    backbone, backbone_model = resolve_backbone(args.backbone, args.backbone_model)
+
     if args.dry_run:
         _banner("Dry run — no steps will be executed")
-        _log(f"  chunks_dir : {chunks_dir}/")
-        _log(f"  outdir     : {outdir}/")
-        _log(f"  model      : {args.model}")
-        _log(f"  bin_size   : {args.bin_size}")
-        _log(f"  batch_size : {args.batch_size}")
-        _log(f"  force      : {args.force}")
+        _log(f"  chunks_dir     : {chunks_dir}/")
+        _log(f"  outdir         : {outdir}/")
+        _log(f"  backbone       : {backbone}")
+        _log(f"  backbone_model : {backbone_model}")
+        _log(f"  bin_size       : {args.bin_size}")
+        _log(f"  batch_size     : {args.batch_size}")
+        _log(f"  force          : {args.force}")
         _log(f"  Species that would be embedded: {[f.stem for f in chunk_files]}")
         _log("  Exiting (--dry_run).")
         sys.exit(0)
@@ -724,7 +881,8 @@ def run_generate_embeddings(args) -> None:
         device = torch.device("cpu")
     _log(f"Using device: {device}")
 
-    tokenizer, model = load_hyena_model(args.model, device)
+    tokenizer, model = load_backbone(backbone, backbone_model, device)
+    registry_entry = BACKBONE_REGISTRY[backbone]
 
     t_start = time.monotonic()
     tracker = _start_tracker("ShoggoTEh_generate_embeddings", logs_dir, args.disable_co2_tracking)
@@ -737,6 +895,9 @@ def run_generate_embeddings(args) -> None:
                 chunks_path=chunk_path, outdir=outdir,
                 tokenizer=tokenizer, model=model, device=device,
                 bin_size=args.bin_size, batch_size=args.batch_size,
+                backbone=backbone, backbone_model=backbone_model,
+                hidden_state_fn=registry_entry["hidden_state_fn"],
+                forward_kwargs=registry_entry["forward_kwargs"],
                 force=args.force,
             )
             if dim:
@@ -759,10 +920,11 @@ def run_generate_embeddings(args) -> None:
         "n_species_processed": n_species_processed,
         "hidden_dim":          hidden_dim,
         "parameters": {
-            "model":      args.model,
-            "bin_size":   args.bin_size,
-            "batch_size": args.batch_size,
-            "device":     str(device),
+            "backbone":       backbone,
+            "backbone_model": backbone_model,
+            "bin_size":       args.bin_size,
+            "batch_size":     args.batch_size,
+            "device":         str(device),
         },
         "resource_usage": {
             "wall_clock_s":       round(elapsed_s, 1),
@@ -909,10 +1071,35 @@ def load_dense_embeddings(embeddings_dir: Path, labels: list) -> tuple:
     if len(hidden_dim_vals) > 1:
         print(f"ERROR: inconsistent hidden_dim across the embeddings corpus: "
               f"{hidden_dim_vals}. Regenerate all species with the same "
-              f"--model.", file=sys.stderr)
+              f"--backbone/--backbone_model.", file=sys.stderr)
         sys.exit(1)
     n_bins     = int(n_bins_vals[0])
     hidden_dim = int(hidden_dim_vals[0])
+
+    # Backbone/backbone_model provenance: read back off the embeddings
+    # themselves (written by process_species_embed), not trusted from any
+    # CLI flag, so a mixed-backbone corpus (different species embedded with
+    # different backbones -- semantically incompatible embedding spaces) is
+    # caught here rather than silently producing a nonsense-trained model.
+    if "backbone" in df.columns and "backbone_model" in df.columns:
+        backbone_vals = df["backbone"].unique()
+        backbone_model_vals = df["backbone_model"].unique()
+        if len(backbone_vals) > 1 or len(backbone_model_vals) > 1:
+            print(f"ERROR: mixed-backbone embeddings corpus detected — "
+                  f"backbone(s): {list(backbone_vals)}, "
+                  f"backbone_model(s): {list(backbone_model_vals)}. "
+                  f"All species must be embedded with the same "
+                  f"--backbone/--backbone_model before training. Regenerate "
+                  f"the mismatched species' embeddings.", file=sys.stderr)
+            sys.exit(1)
+        backbone       = str(backbone_vals[0])
+        backbone_model = str(backbone_model_vals[0])
+    else:
+        _log("  WARNING: embeddings corpus has no recorded backbone/"
+             "backbone_model columns (generated by an older ShoggoTEh "
+             "version) — assuming 'hyena' (legacy default) for "
+             "model_config.json provenance.")
+        backbone, backbone_model = "hyena", BACKBONE_REGISTRY["hyena"]["default_model"]
 
     label_to_idx = {lbl: i for i, lbl in enumerate(labels)}
 
@@ -937,7 +1124,7 @@ def load_dense_embeddings(embeddings_dir: Path, labels: list) -> tuple:
     ])
     y = np.stack([np.asarray(idxs, dtype=np.int64) for idxs in bin_idx])
 
-    return X, y, n_bins, hidden_dim
+    return X, y, n_bins, hidden_dim, backbone, backbone_model
 
 
 def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
@@ -1062,8 +1249,10 @@ def run_train_classifier(args) -> None:
         device = torch.device("cpu")
     _log(f"Using device: {device}")
 
-    X, y, n_bins, hidden_dim = load_dense_embeddings(embeddings_dir, args.labels)
-    _log(f"Loaded {X.shape[0]:,} chunks | n_bins={n_bins} | hidden_dim={hidden_dim}")
+    X, y, n_bins, hidden_dim, backbone, backbone_model = load_dense_embeddings(
+        embeddings_dir, args.labels)
+    _log(f"Loaded {X.shape[0]:,} chunks | n_bins={n_bins} | hidden_dim={hidden_dim} | "
+         f"backbone={backbone} | backbone_model={backbone_model}")
 
     # Stratify the chunk-level split by each chunk's dominant bin label
     # (a per-chunk proxy — the classifier itself trains at bin resolution).
@@ -1121,6 +1310,13 @@ def run_train_classifier(args) -> None:
         "input_dim": hidden_dim, "cnn_channels": args.cnn_channels,
         "kernel_size": args.kernel_size, "n_classes": len(args.labels),
         "dropout": args.dropout, "bin_size_trained_on": None,
+        # Backbone/backbone_model actually used to produce the embeddings
+        # this model was trained on (read back from the embeddings
+        # themselves in load_dense_embeddings, not from any CLI flag) --
+        # predict reads these back to auto-correct/warn on a mismatched
+        # --backbone/--backbone_model instead of silently mixing embedding
+        # spaces.
+        "backbone": backbone, "backbone_model": backbone_model,
     }
     with open(outdir / "model_config.json", "w") as fh:
         json.dump(model_config, fh, indent=2)
@@ -1173,6 +1369,8 @@ def run_train_classifier(args) -> None:
         "n_classes":    len(args.labels),
         "n_bins":       n_bins,
         "hidden_dim":   hidden_dim,
+        "backbone":       backbone,
+        "backbone_model": backbone_model,
         "n_train_chunks": len(X_train),
         "n_val_chunks":    len(X_val),
         "best_val_loss": best_val_loss,
@@ -1231,6 +1429,57 @@ def load_classifier_dense(model_dir: Path, device):
          f"n_classes={cfg['n_classes']}")
     _log(f"Labels: {labels}")
     return model, crf, labels
+
+
+def resolve_predict_backbone(model_dir: Path, cli_backbone, cli_backbone_model) -> tuple:
+    """model_config.json (written by train_classifier from the embeddings'
+    own recorded provenance) is the authoritative source of truth for which
+    backbone + checkpoint the loaded classifier was trained on -- a model
+    trained on backbone X's embeddings produces garbage predictions if the
+    input genome is embedded with backbone Y instead (different,
+    semantically incompatible embedding spaces), with no error to signal
+    it. If the user's --backbone/--backbone_model CLI flags disagree with
+    what's recorded, auto-correct to the recorded values with a clear
+    warning (the least-surprising choice -- predict then always matches the
+    model it's using, rather than failing on an easy-to-make CLI typo)."""
+    config_path = model_dir / "model_config.json"
+    recorded_backbone = None
+    recorded_model = None
+    if config_path.exists():
+        with open(config_path) as fh:
+            cfg = json.load(fh)
+        recorded_backbone = cfg.get("backbone")
+        recorded_model = cfg.get("backbone_model")
+
+    if recorded_backbone is None:
+        _log("  model_config.json has no recorded backbone (model trained "
+             "with an older ShoggoTEh version) — assuming 'hyena' (legacy default)")
+        recorded_backbone = "hyena"
+        recorded_model = recorded_model or BACKBONE_REGISTRY["hyena"]["default_model"]
+    if recorded_backbone not in BACKBONE_REGISTRY:
+        print(f"ERROR: model_config.json records an unknown backbone "
+              f"'{recorded_backbone}'. Choices: {sorted(BACKBONE_REGISTRY)}",
+              file=sys.stderr)
+        sys.exit(1)
+    recorded_model = recorded_model or BACKBONE_REGISTRY[recorded_backbone]["default_model"]
+
+    # Compared unconditionally (not just when the user explicitly passed
+    # --backbone) because --backbone's CLI default ("hyena") is itself a
+    # real value indistinguishable from an explicit choice -- and a
+    # default-hyena predict run against a model trained on a different
+    # backbone is exactly the silent-mismatch failure mode this check
+    # exists to catch.
+    if cli_backbone != recorded_backbone:
+        _log(f"  WARNING: --backbone {cli_backbone} does not match the backbone "
+             f"model_config.json says this classifier was trained on "
+             f"({recorded_backbone}). Auto-correcting to {recorded_backbone} "
+             f"to avoid silently mixing incompatible embedding spaces.")
+    if cli_backbone_model is not None and cli_backbone_model != recorded_model:
+        _log(f"  WARNING: --backbone_model {cli_backbone_model} does not match "
+             f"the checkpoint model_config.json says this classifier was "
+             f"trained on ({recorded_model}). Auto-correcting to {recorded_model}.")
+
+    return recorded_backbone, recorded_model
 
 
 def rle_encode_bins(bin_records: list) -> list:
@@ -1296,13 +1545,17 @@ def run_predict(args) -> None:
 
     prefix = args.prefix or fasta_path.stem
 
+    backbone, backbone_model = resolve_predict_backbone(
+        model_dir, args.backbone, args.backbone_model)
+
     if args.dry_run:
         _banner("Dry run — no steps will be executed")
         _log(f"  fasta          : {fasta_path}")
         _log(f"  model_dir      : {model_dir}/")
         _log(f"  outdir         : {outdir}/")
         _log(f"  prefix         : {prefix}")
-        _log(f"  hyena_model    : {args.hyena_model}")
+        _log(f"  backbone       : {backbone}")
+        _log(f"  backbone_model : {backbone_model}")
         _log(f"  chunk_size     : {args.chunk_size}")
         _log(f"  bin_size       : {args.bin_size}")
         _log(f"  overlap        : {args.overlap}")
@@ -1325,7 +1578,8 @@ def run_predict(args) -> None:
         device = torch.device("cpu")
     _log(f"Using device: {device}")
 
-    tokenizer, hyena_model = load_hyena_model(args.hyena_model, device)
+    tokenizer, backbone_encoder = load_backbone(backbone, backbone_model, device)
+    registry_entry = BACKBONE_REGISTRY[backbone]
     model, crf, labels = load_classifier_dense(model_dir, device)
 
     t_start = time.monotonic()
@@ -1358,7 +1612,9 @@ def run_predict(args) -> None:
 
     _log("Generating dense per-bin embeddings ...")
     pooled_list = embed_sequences_dense(sequences, n_bins, args.bin_size,
-                                        tokenizer, hyena_model, device, args.batch_size)
+                                        tokenizer, backbone_encoder, device, args.batch_size,
+                                        hidden_state_fn=registry_entry["hidden_state_fn"],
+                                        forward_kwargs=registry_entry["forward_kwargs"])
 
     _log("Running CNN + CRF forward pass and Viterbi decode ...")
     bin_records = []
@@ -1409,7 +1665,8 @@ def run_predict(args) -> None:
         "n_skipped_n":     skipped_n,
         "n_bed_intervals": len(intervals),
         "parameters": {
-            "hyena_model": args.hyena_model, "chunk_size": args.chunk_size,
+            "backbone": backbone, "backbone_model": backbone_model,
+            "chunk_size": args.chunk_size,
             "bin_size": args.bin_size, "overlap": args.overlap,
             "max_n_fraction": args.max_n_fraction, "batch_size": args.batch_size,
             "device": str(device),
@@ -1721,8 +1978,14 @@ def _build_parser() -> argparse.ArgumentParser:
     req.add_argument("--outdir", required=True, type=Path, metavar="DIR",
                      help="Output directory for per-species embedding Parquet files")
     opt = gp.add_argument_group("optional")
-    opt.add_argument("--model", default="LongSafari/hyenadna-medium-160k-seqlen-hf",
-                     metavar="NAME", help="Hyena-DNA model on HuggingFace Hub")
+    opt.add_argument("--backbone", choices=sorted(BACKBONE_REGISTRY), default="hyena",
+                     help="Embedding backbone to use (default: hyena). "
+                          "A/B-test alternative pretrained genomic language "
+                          "models against the Hyena-DNA default.")
+    opt.add_argument("--backbone_model", default=None, metavar="NAME",
+                     help="HuggingFace Hub checkpoint override for --backbone "
+                          "(default: the backbone's own sensible default -- "
+                          "see BACKBONE_REGISTRY in the script)")
     opt.add_argument("--bin_size", type=int, default=50, metavar="BP",
                      help="Per-bin pooling resolution in bp; must match the "
                           "chunks' bin_size (default: 50)")
@@ -1793,8 +2056,17 @@ def _build_parser() -> argparse.ArgumentParser:
     opt = dp.add_argument_group("optional")
     opt.add_argument("--prefix", default=None, metavar="STR",
                      help="Output filename prefix (default: FASTA filename stem)")
-    opt.add_argument("--hyena_model", default="LongSafari/hyenadna-medium-160k-seqlen-hf",
-                     metavar="NAME", help="Hyena-DNA model on HuggingFace Hub")
+    opt.add_argument("--backbone", choices=sorted(BACKBONE_REGISTRY), default="hyena",
+                     help="Embedding backbone to use (default: hyena). "
+                          "model_config.json in --model_dir is authoritative: "
+                          "if this conflicts with what the classifier was "
+                          "actually trained on, ShoggoTEh auto-corrects and "
+                          "logs a WARNING rather than silently mixing "
+                          "incompatible embedding spaces.")
+    opt.add_argument("--backbone_model", default=None, metavar="NAME",
+                     help="HuggingFace Hub checkpoint override for --backbone "
+                          "(default: the backbone's own sensible default). "
+                          "Same model_config.json auto-correction applies.")
     opt.add_argument("--chunk_size", type=int, default=5000, metavar="BP",
                      help="Window size in bp (default: 5000)")
     opt.add_argument("--bin_size", type=int, default=50, metavar="BP",

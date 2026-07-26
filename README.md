@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.3.0-teal" alt="Version v0.3.0"/>
+  <img src="https://img.shields.io/badge/version-v0.4.0-teal" alt="Version v0.4.0"/>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
 </p>
@@ -16,7 +16,7 @@
 
 A deep learning pipeline for identifying and classifying transposable elements (TEs) in plant genomes using DNA language model embeddings.
 
-ShoggoTEh uses [Hyena-DNA](https://github.com/HazyResearch/hyena-dna) to generate per-nucleotide sequence embeddings, pools them into small bins (default 50bp), and runs a dense (per-bin) CNN + linear-chain CRF sequence labeler to distinguish TE classes, genic, and intergenic regions at near-base-level resolution — without relying on alignment-based repeat detection.
+ShoggoTEh uses a pretrained DNA language model — [Hyena-DNA](https://github.com/HazyResearch/hyena-dna) by default, with [Nucleotide Transformer](https://github.com/instadeepai/nucleotide_transformer) and [PlantCaduceus](https://github.com/kuleshov-group/PlantCaduceus) available as swappable alternative embedding backbones (`--backbone`) — to generate per-nucleotide sequence embeddings, pools them into small bins (default 50bp), and runs a dense (per-bin) CNN + linear-chain CRF sequence labeler to distinguish TE classes, genic, and intergenic regions at near-base-level resolution — without relying on alignment-based repeat detection.
 
 > *Named after the Shoggoths of H.P. Lovecraft's mythos — shapeshifting entities, much like transposable elements that continuously reshape the genome.*
 
@@ -35,9 +35,12 @@ ShoggoTEh.py prepare_dataset       Slide windows (default 5 kb) across each
                                     Output: {outdir}/{species}.parquet
       │
       ▼
-ShoggoTEh.py generate_embeddings   Run chunks through Hyena-DNA (frozen) and
-                                    pool per-nucleotide hidden states into
-                                    per-bin embeddings ([n_bins, hidden_dim]).
+ShoggoTEh.py generate_embeddings   Run chunks through the chosen embedding
+                                    backbone (frozen; --backbone hyena by
+                                    default, or nucleotide_transformer /
+                                    plantcaduceus) and pool per-token hidden
+                                    states into per-bin embeddings
+                                    ([n_bins, hidden_dim]).
                                     Output: {outdir}/{species}.parquet
       │
       ▼
@@ -133,7 +136,8 @@ python3 scripts/ShoggoTEh.py generate_embeddings \
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--model` | `LongSafari/hyenadna-medium-160k-seqlen-hf` | Hyena-DNA model on HuggingFace Hub |
+| `--backbone` | `hyena` | Embedding backbone: `hyena`, `nucleotide_transformer`, or `plantcaduceus` — see [Embedding backbones](#embedding-backbones) below |
+| `--backbone_model` | backbone's own default | HuggingFace Hub checkpoint override for `--backbone` (e.g. a larger Nucleotide Transformer or PlantCaduceus variant). Formerly `--model` (renamed; `--model` no longer exists) |
 | `--bin_size` | `50` | Per-bin pooling resolution in bp; must match the chunks' `bin_size` |
 | `--batch_size` | `32` | Sequences per forward pass |
 | `--device` | auto | `cuda`, `mps`, or `cpu` |
@@ -141,9 +145,21 @@ python3 scripts/ShoggoTEh.py generate_embeddings \
 | `--dry_run` | off | Validate inputs, print steps, exit without running |
 | `--disable_co2_tracking` | off | Skip codecarbon energy/CO₂ tracking for this run |
 
-Hyena-DNA tokenizes at single-nucleotide resolution, so its per-token hidden states are already base-pair resolution — no interpolation needed. Instead of mean-pooling an entire window into one vector, hidden states are reshaped and averaged within each bin, producing a `[n_bins, hidden_dim]` embedding per chunk. The tokenizer's trailing EOS/SEP token is dropped before pooling so bin boundaries map correctly back to genomic coordinates. The Hyena-DNA backbone stays frozen.
+Each backbone's per-token hidden states are pooled into per-bin embeddings by `embed_sequences_dense()`, which works identically regardless of tokenization scheme: the effective **tokens-per-bp ratio is computed dynamically per sequence** (`valid_content_token_len / len(raw_sequence_bp)`, after generically dropping whichever of CLS/BOS/EOS/SEP special tokens the tokenizer added), then each bin pools `round(bin_size * tokens_per_bp)` tokens. This means the pipeline needs no per-backbone hardcoding for Hyena-DNA's 1-token/bp scheme vs. Nucleotide Transformer's ~6-tokens/bp (6-mer, with single-nucleotide fallback tokens for remainders) vs. whatever PlantCaduceus turns out to use. The chosen backbone stays frozen (no fine-tuning).
 
-Output: one Parquet file per species under `data/embeddings/` with columns `species`, `chrom`, `start`, `end`, `bin_labels`, `n_bins`, `bin_size`, `repeat_fraction`, `embedding_bytes` (raw `float32` bytes of the `[n_bins x hidden_dim]` array, decoded via `np.frombuffer`), `hidden_dim`. The `sequence` column is dropped to save space; it remains in the chunks Parquet. Embeddings are stored as raw bytes rather than nested Python float lists — at genome scale, `.tolist()`-style boxing inflates RAM far beyond the raw array size and can OOM the process during DataFrame construction.
+Output: one Parquet file per species under `data/embeddings/` with columns `species`, `chrom`, `start`, `end`, `bin_labels`, `n_bins`, `bin_size`, `repeat_fraction`, `embedding_bytes` (raw `float32` bytes of the `[n_bins x hidden_dim]` array, decoded via `np.frombuffer`), `hidden_dim`, `backbone`, `backbone_model` (the last two record exactly which backbone + checkpoint produced this species' embeddings, so `train_classifier` can detect a mixed-backbone corpus instead of silently training on incompatible embedding spaces). The `sequence` column is dropped to save space; it remains in the chunks Parquet. Embeddings are stored as raw bytes rather than nested Python float lists — at genome scale, `.tolist()`-style boxing inflates RAM far beyond the raw array size and can OOM the process during DataFrame construction.
+
+#### Embedding backbones
+
+An explicit A/B-testing feature for comparing pretrained genomic language models on TE classification accuracy/speed — **not a replacement for the Hyena-DNA default**.
+
+| `--backbone` | Default `--backbone_model` | Loaded via | Hidden states from |
+|---|---|---|---|
+| `hyena` (default) | `LongSafari/hyenadna-medium-160k-seqlen-hf` | `AutoModel` / `AutoTokenizer` | `out.last_hidden_state` |
+| `nucleotide_transformer` | `InstaDeepAI/nucleotide-transformer-v2-50m-multi-species` | `AutoModel` / `AutoTokenizer` | `out.last_hidden_state` |
+| `plantcaduceus` | `kuleshov-group/PlantCaduceus_l20` | `AutoModelForMaskedLM` / `AutoTokenizer` (note: **not** plain `AutoModel`) | `out.hidden_states[-1]` (called with `output_hidden_states=True`) |
+
+All three load with `trust_remote_code=True`. To add a fourth backbone, add one entry to `BACKBONE_REGISTRY` in `scripts/ShoggoTEh.py` (a `load_fn(model_name, device) -> (tokenizer, model)`, the right `hidden_state_fn`, and `forward_kwargs` if the model needs `output_hidden_states=True` or similar) — the shared batching/pooling loop in `embed_sequences_dense()` needs no changes.
 
 ### 4. Train classifier (1D-CNN + linear-chain CRF)
 
@@ -178,7 +194,7 @@ Output files in `--outdir`:
 |------|-------------|
 | `classifier.pt` | Best model weights (CNN + CRF state dicts) |
 | `label_encoder.json` | Label ↔ index mapping |
-| `model_config.json` | Architecture hyperparameters (needed to reload the model in `predict`) |
+| `model_config.json` | Architecture hyperparameters, plus `backbone`/`backbone_model` — read back from the embeddings' own recorded provenance (not from any CLI flag), and used to reload the model and validate/auto-correct `predict`'s `--backbone`/`--backbone_model` |
 | `training_metrics.tsv` | Per-epoch train/val loss and **bin-level** accuracy |
 | `classification_report.txt` | Per-class precision, recall, F1 on the validation set (bin-level, post-CRF-decode) |
 
@@ -194,7 +210,8 @@ python3 scripts/ShoggoTEh.py predict \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--prefix` | FASTA stem | Output filename prefix |
-| `--hyena_model` | `LongSafari/hyenadna-medium-160k-seqlen-hf` | Hyena-DNA model |
+| `--backbone` | `hyena` | Embedding backbone (see [Embedding backbones](#embedding-backbones)). Formerly `--hyena_model` selected the checkpoint directly; that flag no longer exists |
+| `--backbone_model` | backbone's own default | HuggingFace Hub checkpoint override for `--backbone` |
 | `--chunk_size` | `5000` | Window size in bp |
 | `--bin_size` | `50` | Per-bin resolution in bp; must match the trained model's `bin_size` |
 | `--overlap` | `0.0` | Fractional overlap between windows — the dense architecture does not need the old pipeline's redundant 50% overlap |
@@ -203,6 +220,8 @@ python3 scripts/ShoggoTEh.py predict \
 | `--device` | auto | `cuda`, `mps`, or `cpu` |
 | `--dry_run` | off | Validate inputs, print steps, exit without running |
 | `--disable_co2_tracking` | off | Skip codecarbon energy/CO₂ tracking for this run |
+
+**Backbone/checkpoint mismatch safeguard**: `model_dir/model_config.json` records the exact backbone + checkpoint the classifier was actually trained on (read back from the embeddings' own provenance at training time, not from a CLI flag). If `--backbone`/`--backbone_model` disagree with what's recorded — including the default `--backbone hyena` disagreeing with a model trained on a different backbone — `predict` logs a `WARNING` and **auto-corrects to the recorded values** rather than silently embedding the input genome with an incompatible embedding space.
 
 Per-bin predictions (post Viterbi decode) are run-length-encoded: consecutive bins with the same label are merged into a single BED interval, with confidence = mean per-bin softmax probability of the assigned label across the merged interval.
 
@@ -319,7 +338,8 @@ Reference defaults (also the argparse defaults baked into each subcommand):
 | `bin_size` | `50` | Per-bin label/embedding resolution in bp |
 | `overlap` | `0.5` (prepare_dataset) / `0.0` (predict) | Fractional overlap between windows |
 | `max_n_fraction` | `0.1` | Max N fraction per chunk |
-| `hyena_model` | `LongSafari/hyenadna-medium-160k-seqlen-hf` | Hyena-DNA model variant |
+| `backbone` | `hyena` | Embedding backbone (`hyena`, `nucleotide_transformer`, `plantcaduceus`) |
+| `backbone_model` | backbone's own default | HuggingFace Hub checkpoint override |
 | `embedding_batch_size` | `32` | Batch size for embedding generation |
 
 ## Training data
@@ -330,7 +350,9 @@ ShoggoTEh v0.1.0 is trained on EarlGrey repeat annotations from 185 plant specie
 
 | Tool | Repository |
 |------|-----------|
-| Hyena-DNA | https://github.com/HazyResearch/hyena-dna |
+| Hyena-DNA (default `--backbone`) | https://github.com/HazyResearch/hyena-dna |
+| Nucleotide Transformer (`--backbone nucleotide_transformer`) | https://github.com/instadeepai/nucleotide_transformer |
+| PlantCaduceus (`--backbone plantcaduceus`) | https://github.com/kuleshov-group/PlantCaduceus |
 | EarlGrey | https://github.com/TobyBaril/EarlGrey |
 | CodeCarbon | https://github.com/mlco2/codecarbon |
 | pyfaidx | https://github.com/mdshw5/pyfaidx |

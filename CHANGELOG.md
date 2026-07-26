@@ -5,6 +5,84 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.4.0] — 2026-07-26
+
+### Added
+
+- **Pluggable embedding-backbone support** — `generate_embeddings` and
+  `predict` gain a `--backbone {hyena,nucleotide_transformer,plantcaduceus}`
+  flag (default: `hyena`, preserving current behaviour exactly when
+  unspecified) so different pretrained genomic language models can be
+  A/B-tested against each other (this is explicitly an experimentation
+  feature, not a replacement of Hyena-DNA as the default — motivated by a
+  real, measured problem: SINE recall was 0% on a real Zea_mays pilot run
+  with Hyena-DNA, prompting interest in whether an alternative backbone
+  does better).
+  - New `BACKBONE_REGISTRY` in `scripts/ShoggoTEh.py`: `hyena` (`AutoModel`
+    + `AutoTokenizer`, hidden states via `out.last_hidden_state`, default
+    checkpoint `LongSafari/hyenadna-medium-160k-seqlen-hf`),
+    `nucleotide_transformer` (same `AutoModel` pattern, default checkpoint
+    `InstaDeepAI/nucleotide-transformer-v2-50m-multi-species`), and
+    `plantcaduceus` (`AutoModelForMaskedLM` — **not** plain `AutoModel` —
+    hidden states via `output_hidden_states=True` + `out.hidden_states[-1]`,
+    default checkpoint `kuleshov-group/PlantCaduceus_l20`). Adding a 4th
+    backbone is one registry entry (a `load_fn`, a `hidden_state_fn`, and
+    optional `forward_kwargs`) — no changes needed to the shared
+    batching/pooling loop.
+  - **`embed_sequences_dense()` generalised to any tokenization scheme**:
+    the effective tokens-per-bp ratio is now computed *dynamically per
+    sequence* (`valid_content_token_len / len(raw_sequence_bp)`, after
+    generically dropping whichever of CLS/BOS (leading) and EOS/SEP
+    (trailing) special tokens the tokenizer added — checked via
+    `tokenizer.cls_token_id` / `bos_token_id` / `eos_token_id` /
+    `sep_token_id`, not hardcoded to EOS-only as before) rather than
+    assuming a fixed tokens/bp ratio per backbone. This correctly handles
+    Hyena-DNA's 1 token/bp, Nucleotide Transformer's ~6 tokens/bp (6-mer
+    tokenization with single-nucleotide fallback tokens for
+    non-multiple-of-6 remainders), and whatever scheme a future backbone
+    uses, without per-backbone special-casing. New helper
+    `_pool_bins_from_hidden()` recomputes each bin's token boundary from
+    scratch (`round(i * bin_size * tokens_per_bp)`) so rounding error
+    cannot drift across bins, and falls back gracefully (repeats the
+    previous bin, or zero-fills the first) when a short trailing chunk
+    yields zero tokens for a bin.
+  - **`--model` (generate_embeddings) / `--hyena_model` (predict) renamed to
+    `--backbone_model`** (default: `None`, meaning "use the resolved
+    `--backbone`'s own sensible default checkpoint"). These old flag names
+    no longer exist.
+- **Backbone/checkpoint provenance tracking, to prevent silently mixing
+  incompatible embedding spaces** — a classifier trained on backbone X's
+  embeddings produces meaningless predictions if a later `predict` run
+  embeds the input genome with backbone Y instead, with no error to signal
+  the mismatch:
+  - `generate_embeddings` now writes `backbone` and `backbone_model`
+    columns into each species' embeddings Parquet (alongside the existing
+    `hidden_dim` column), recording exactly what produced that species'
+    embeddings.
+  - `train_classifier`'s `load_dense_embeddings()` reads `backbone`/
+    `backbone_model` back off the loaded embeddings (not from any CLI
+    flag) and **errors out clearly** if a mixed-backbone corpus is detected
+    (different species embedded with different backbones/checkpoints).
+    `model_config.json` now records the backbone/checkpoint actually used,
+    sourced from this validated embeddings metadata.
+  - `predict` reads `model_config.json` and compares it against the
+    resolved `--backbone`/`--backbone_model`; on any mismatch (including
+    the CLI default `--backbone hyena` silently disagreeing with a model
+    trained on a different backbone) it logs a `WARNING` and
+    **auto-corrects** to the values recorded in `model_config.json` — the
+    least-surprising choice, since predict then always matches the model
+    it is actually using.
+  - Older embeddings/models without recorded backbone metadata are handled
+    gracefully: `load_dense_embeddings()` and `predict` both assume
+    `hyena` (the previous hardcoded/legacy default) and log a note rather
+    than failing.
+
+### Changed
+
+- `envs/shoggoTEh.yaml` unchanged — all three backbones load via the
+  already-present `transformers`/`torch` dependencies; no new packages
+  required.
+
 ## [v0.3.2] — 2026-07-25
 
 ### Fixed
