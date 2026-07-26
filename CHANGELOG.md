@@ -5,6 +5,31 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.4.1] — 2026-07-26
+
+### Fixed
+
+- **`compare_te_annotation` reported near-zero accuracy (0.18%) on a real
+  Zea_mays EarlGrey benchmark due to a `bedtools intersect -wao` field-index
+  bug in `assign_reference_labels()`.** The target BED has 3 columns
+  (chrom, start, end) and the reference repeats BED has 4 (chrom, start,
+  end, label), so a `-wao` intersection row is
+  `[A.chrom, A.start, A.end, B.chrom, B.start, B.end, B.label, overlap_bp]`
+  (8 fields). The code read `fields[3]` (`B.chrom`, e.g. `"ZmB73C01"`) as
+  the repeat class and `fields[4]` (`B.start`, a coordinate) as the overlap
+  bp — neither is ever `"."`/`0`, so the check that should skip non-overlaps
+  never fired, and every target interval was scored against a bogus
+  "reference class" (a chromosome name) with a bogus bp count. Fixed to
+  `fields[-2]`/`fields[-1]`, matching the (already-correct) pattern used a
+  few lines below for `gene_overlaps`. Confirmed the real reference BED
+  columns match this analysis exactly (`chrom, start, end,
+  classification, score, strand`) via a user-supplied `head` of the file.
+  This bug predates the dense-architecture rewrite and affected every
+  `compare_te_annotation` run to date — re-run any prior comparison to get
+  a valid accuracy number.
+
+---
+
 ## [v0.4.0] — 2026-07-26
 
 ### Added

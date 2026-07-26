@@ -52,7 +52,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.4.0"
+VERSION = "v0.4.1"
 
 import argparse
 import getpass
@@ -1734,8 +1734,8 @@ def assign_reference_labels(target_df: pd.DataFrame, repeats_df: pd.DataFrame,
     rep_overlaps: dict = {}
     for feat in rep_intersect:
         key = (feat.chrom, int(feat.start), int(feat.end))
-        rep_class = feat.fields[3]
-        bp = int(feat.fields[4])
+        rep_class = feat.fields[-2]
+        bp = int(feat.fields[-1])
         if rep_class != "." and bp > 0:
             rep_overlaps.setdefault(key, {})
             rep_overlaps[key][rep_class] = rep_overlaps[key].get(rep_class, 0) + bp
