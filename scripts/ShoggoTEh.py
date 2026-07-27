@@ -65,7 +65,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.9.0"
+VERSION = "v0.9.1"
 
 import argparse
 import getpass
@@ -256,7 +256,7 @@ def map_repeat_class(classification: str) -> str:
 
 # Nucleotide encoding for the v2 end-to-end dense CNN (train_dense_cnn /
 # predict_dense_cnn): raw sequence -> int64 indices, no pretrained backbone.
-_NT_LOOKUP = np.full(256, 4, dtype=np.int64)  # default: N (or any other IUPAC code)
+_NT_LOOKUP = np.full(256, 4, dtype=np.int8)  # default: N (or any other IUPAC code)
 for _i, _c in enumerate("ACGT"):
     _NT_LOOKUP[ord(_c)] = _i
 del _i, _c
@@ -272,7 +272,7 @@ def encode_sequence(seq: str) -> np.ndarray:
     return _NT_LOOKUP[raw]
 
 
-_RC_COMPLEMENT_MAP = np.array([3, 2, 1, 0, 4], dtype=np.int64)  # A<->T, C<->G, N->N
+_RC_COMPLEMENT_MAP = np.array([3, 2, 1, 0, 4], dtype=np.int8)  # A<->T, C<->G, N->N
 
 
 def reverse_complement_encoded(X: np.ndarray, y: np.ndarray) -> tuple:
@@ -1324,9 +1324,15 @@ def load_dense_sequences(chunks_dir: Path, labels: list) -> tuple:
              "prepare_dataset time -- results will be wrong unless the "
              "label sets match exactly, in the same order.")
 
+    # int8 throughout numpy-side (loading/splitting/RC-augmentation/balanced
+    # -corpus selection): nucleotide indices are 0-4, label indices 0-7, and
+    # torch.tensor(..., dtype=torch.long) already does the int64 upcast right
+    # at DataLoader construction -- carrying int64 through this whole stage
+    # would be 8x the memory for no benefit (870k chunks x 5000bp x 8 bytes
+    # x 2 arrays is ~70GB before any split/augmentation even runs).
     X = np.stack([encode_sequence(s) for s in df["sequence"]])
     y = np.stack([
-        np.frombuffer(b, dtype=np.int8).astype(np.int64)
+        np.frombuffer(b, dtype=np.int8)
         for b in df["base_labels_bytes"]
     ])
 

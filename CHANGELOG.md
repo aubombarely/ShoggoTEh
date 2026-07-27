@@ -5,6 +5,25 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.9.1] — 2026-07-27
+
+### Changed
+
+- **`train_dense_cnn`'s numpy-side sequence/label arrays are now `int8`,
+  not `int64`.** Raised when the user reported the real Zea_mays training
+  run using ~20% of Salvia's RAM just loading 870,816 chunks (`X`+`y` at
+  `int64` is ~70GB for that corpus size, before the train/val split or RC
+  augmentation even run). Nucleotide indices only ever take 5 values
+  (0-4) and label indices at most 8 (0-7), and `torch.tensor(...,
+  dtype=torch.long)` already does the int64 upcast right at `DataLoader`
+  construction — carrying `int64` through loading, splitting, RC
+  augmentation, and balanced-corpus selection was pure 8x waste.
+  `_NT_LOOKUP` and `_RC_COMPLEMENT_MAP` switched to `int8`; the
+  `.astype(np.int64)` dropped from `load_dense_sequences`'s label
+  construction. Verified downstream compatibility (`sklearn`'s
+  `compute_class_weight`, `torch.tensor(..., dtype=torch.long)` cast) with
+  a standalone check before pushing.
+
 ## [v0.9.0] — 2026-07-27
 
 ### Added
