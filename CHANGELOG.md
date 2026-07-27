@@ -5,6 +5,30 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.8.1] — 2026-07-27
+
+### Added
+
+- **`predict_dense_cnn` now logs periodic progress** (segments processed,
+  %, seg/s, elapsed, ETA) at most once every 30s, regardless of
+  `--batch_size`. Found live on a real genome-scale Zea_mays run: the only
+  prior signal between per-chromosome log lines was total silence, and at
+  the CRF-decode-bound speeds already flagged in v0.8.0, a single
+  chromosome can take a long time — there was no way to distinguish
+  slow-but-working from stalled, and no way to compare throughput before
+  and after a `--batch_size` change without waiting for a whole
+  chromosome to finish. Total segment count is now computed up front
+  (tiling every chromosome before processing starts — cheap, pure
+  arithmetic) so the progress line has a real denominator from the start.
+
+### Changed
+
+- `run_predict_dense_cnn()` tiles all chromosomes into `chrom_segments`
+  once, up front, and reuses those segments in the main processing loop
+  instead of recomputing `make_predict_segments()` per chromosome.
+
+---
+
 ## [v0.8.0] — 2026-07-26
 
 ### Added

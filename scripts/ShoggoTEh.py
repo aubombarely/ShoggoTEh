@@ -65,7 +65,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.8.0"
+VERSION = "v0.8.1"
 
 import argparse
 import getpass
@@ -2114,11 +2114,32 @@ def run_predict_dense_cnn(args) -> None:
     _log(f"Loading genome: {fasta_path}")
     fasta = Fasta(str(fasta_path))
 
+    # Tile every chromosome up front (cheap -- pure arithmetic, no sequence
+    # extraction) so the total segment count is known before processing
+    # starts. This is what makes real progress reporting possible below:
+    # without a known denominator, a long genome-scale run gives no signal
+    # between per-chromosome log lines, which for a multi-hour run (as
+    # observed in production -- see CHANGELOG v0.8.0's flagged CRF-decode
+    # cost) leaves no way to tell slow-but-working apart from stalled.
+    chrom_segments = {}
+    n_segments_total = 0
+    for chrom in fasta.keys():
+        chrom_len = len(fasta[chrom])
+        if chrom_len == 0:
+            continue
+        segs = make_predict_segments(chrom_len, args.window_size, args.overlap)
+        chrom_segments[chrom] = segs
+        n_segments_total += len(segs)
+    _log(f"{len(chrom_segments):,} chromosomes/scaffolds -> "
+         f"{n_segments_total:,} segments total")
+
     intervals = []
     open_iv = None
     label_counts = Counter()
-    n_segments_total = 0
+    n_segments_processed = 0
     n_segments_skipped_n = 0
+    last_progress_log = t_start
+    PROGRESS_LOG_INTERVAL_S = 30
 
     def _flush_batch(pending):
         """pending: list of (chrom, seg_start, seg_end, win_start, win_end,
@@ -2128,8 +2149,11 @@ def run_predict_dense_cnn(args) -> None:
         CRF's sequential Python-loop decode cost across every sequence in
         the batch, not just the model's own compute), then streams each
         window's core region into the running RLE state in the same
-        order the windows were generated."""
-        nonlocal open_iv
+        order the windows were generated. Logs progress at most once every
+        PROGRESS_LOG_INTERVAL_S seconds, regardless of --batch_size, so a
+        multi-hour genome-scale run stays observable without flooding the
+        log at small batch sizes."""
+        nonlocal open_iv, n_segments_processed, last_progress_log
         if not pending:
             return
         Xb = torch.tensor(np.stack([encode_sequence(p[5]) for p in pending]),
@@ -2150,20 +2174,29 @@ def run_predict_dense_cnn(args) -> None:
                 open_iv = _stream_rle_step(intervals, open_iv, chrom, pos,
                                            label, float(prob_row[i, cls_idx]))
 
+        n_segments_processed += len(pending)
+        now = time.monotonic()
+        if now - last_progress_log >= PROGRESS_LOG_INTERVAL_S:
+            elapsed = now - t_start
+            rate = n_segments_processed / elapsed if elapsed > 0 else 0.0
+            remaining = n_segments_total - n_segments_processed
+            eta_min = (remaining / rate / 60) if rate > 0 else float("nan")
+            pct = 100 * n_segments_processed / n_segments_total if n_segments_total else 0.0
+            _log(f"  progress: {n_segments_processed:,}/{n_segments_total:,} segments "
+                 f"({pct:.1f}%) | {rate:.1f} seg/s | elapsed {elapsed/60:.1f} min "
+                 f"| ETA {eta_min:.1f} min")
+            last_progress_log = now
+
     pending, pending_len = [], None
-    for chrom in fasta.keys():
-        chrom_len = len(fasta[chrom])
-        if chrom_len == 0:
-            continue
-        segments = make_predict_segments(chrom_len, args.window_size, args.overlap)
-        _log(f"{chrom}: {chrom_len:,}bp -> {len(segments):,} segments")
+    for chrom, segments in chrom_segments.items():
+        _log(f"{chrom}: {len(fasta[chrom]):,}bp -> {len(segments):,} segments")
 
         for seg_start, seg_end, win_start, win_end in segments:
-            n_segments_total += 1
             win_seq = str(fasta[chrom][win_start:win_end]).upper()
             n_frac = win_seq.count("N") / len(win_seq) if win_seq else 1.0
             if n_frac > args.max_n_fraction:
                 n_segments_skipped_n += 1
+                n_segments_processed += 1
                 continue
 
             win_len = win_end - win_start
