@@ -5,6 +5,29 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.9.0] — 2026-07-27
+
+### Added
+
+- **`train_dense_cnn` reverse-complement training augmentation**
+  (`--disable_rc_augment` to turn off, on by default). Real
+  `compare_te_annotation` results against the full Zea_mays B73 genome
+  (`overall_accuracy=0.3756` with gene models, SINE recall 0.393 but
+  precision only 0.020) prompted the question of whether the model sees
+  DNA strand at all — it doesn't: the FASTA is read forward-strand only,
+  with no reverse-complement generation or strand feature anywhere in the
+  pipeline. Real repeat families (LTRs especially, with directional
+  internal structure 5'LTR-gag-pol-env-3'LTR) occur on either genomic
+  strand, so a strand-blind model has to learn every motif twice over from
+  a fixed parameter budget. Fix: `reverse_complement_encoded()` doubles
+  the *training* split only (validation stays unaugmented so reported
+  metrics reflect real single-strand inference) by complementing each
+  chunk's encoded nucleotide indices (A<->T, C<->G, N->N via
+  `_RC_COMPLEMENT_MAP`) and reversing both the sequence and its per-base
+  label array along the sequence axis (label identity is strand-invariant;
+  only position order flips). Verified with a hand-checked round-trip
+  (`ACGTN` -> `NACGT`, labels `[0,1,2,3,4]` -> `[4,3,2,1,0]`).
+
 ## [v0.8.1] — 2026-07-27
 
 ### Added

@@ -65,7 +65,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.8.1"
+VERSION = "v0.9.0"
 
 import argparse
 import getpass
@@ -270,6 +270,20 @@ def encode_sequence(seq: str) -> np.ndarray:
     of positions)."""
     raw = np.frombuffer(seq.encode("ascii"), dtype=np.uint8)
     return _NT_LOOKUP[raw]
+
+
+_RC_COMPLEMENT_MAP = np.array([3, 2, 1, 0, 4], dtype=np.int64)  # A<->T, C<->G, N->N
+
+
+def reverse_complement_encoded(X: np.ndarray, y: np.ndarray) -> tuple:
+    """Reverse-complement a batch of encoded nucleotide-index sequences and
+    their matching per-base label sequences (X, y: (n_chunks, seq_len)).
+    Complementing remaps base identity (A<->T, C<->G, N->N); reversing along
+    the sequence axis is what actually puts the model's fixed-orientation
+    dilated-conv receptive field on the opposite strand. Label *identity*
+    doesn't change (a SINE is still a SINE reverse-complemented) -- only its
+    position order, so y is reversed but not remapped."""
+    return _RC_COMPLEMENT_MAP[X][:, ::-1], y[:, ::-1]
 
 
 # ── Windowing (shared: prepare_dataset + predict) ──────────────────────────────
@@ -1347,8 +1361,10 @@ def run_train_dense_cnn(args) -> None:
         _log(f"  balanced_corpus: {args.balanced_corpus}")
         if args.balanced_corpus:
             _log(f"  target_bins_per_class: {args.target_bins_per_class}")
+        _log(f"  rc_augment     : {not args.disable_rc_augment}")
         _log(f"  labels         : {args.labels}")
-        _log("  Steps that would run: load raw-sequence chunks -> train "
+        _log("  Steps that would run: load raw-sequence chunks -> "
+             "[reverse-complement augment train split] -> train "
              "dilated-CNN+CRF sequence labeler (1bp resolution) -> "
              "evaluate -> save model")
         _log("  Exiting (--dry_run).")
@@ -1392,6 +1408,20 @@ def run_train_dense_cnn(args) -> None:
     X_train, X_val = X[idx_train], X[idx_val]
     y_train, y_val = y[idx_train], y[idx_val]
     _log(f"Train: {len(X_train):,} chunks | Val: {len(X_val):,} chunks")
+
+    if not args.disable_rc_augment:
+        # Reverse-complement augmentation: the model otherwise only ever
+        # sees the forward reference strand, so it has to learn every
+        # repeat family's motif twice over (forward AND mirrored) from a
+        # fixed parameter budget -- real biological repeats (LTRs, SINEs,
+        # LINEs) occur on either strand. Doubles the train set only; val
+        # stays unaugmented so reported metrics reflect real single-strand
+        # performance.
+        X_train_rc, y_train_rc = reverse_complement_encoded(X_train, y_train)
+        X_train = np.concatenate([X_train, X_train_rc], axis=0)
+        y_train = np.concatenate([y_train, y_train_rc], axis=0)
+        _log(f"Reverse-complement augmentation: train set doubled to "
+             f"{len(X_train):,} chunks (--disable_rc_augment to turn off)")
 
     torch_mod, nn, DilatedResidualCNN, LinearChainCRF = _build_dilated_cnn_model()
 
@@ -1505,6 +1535,7 @@ def run_train_dense_cnn(args) -> None:
             "patience": args.patience, "class_weight": args.class_weight,
             "balanced_corpus": args.balanced_corpus,
             "target_bins_per_class": args.target_bins_per_class if args.balanced_corpus else None,
+            "rc_augment": not args.disable_rc_augment,
             "seed": args.seed,
         },
         "resource_usage": {
@@ -2949,6 +2980,15 @@ def _build_parser() -> argparse.ArgumentParser:
     opt.add_argument("--target_bins_per_class", type=int, default=20000, metavar="N",
                      help="Target per-class base count for --balanced_corpus "
                           "(default: 20000). Ignored unless --balanced_corpus.")
+    opt.add_argument("--disable_rc_augment", action="store_true",
+                     help="Disable reverse-complement training augmentation "
+                          "(on by default). RC augmentation doubles the "
+                          "training set with each chunk's reverse complement "
+                          "(sequence complemented + reversed, per-base "
+                          "labels reversed to match) so the model learns "
+                          "repeat motifs regardless of strand orientation, "
+                          "since the raw genome sequence it otherwise sees "
+                          "is forward-strand only.")
     opt.add_argument("--seed", type=int, default=42, metavar="N",
                      help="Random seed (default: 42)")
     opt.add_argument("--device", default=None, metavar="DEV",

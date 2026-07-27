@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v0.4.0-teal" alt="Version v0.4.0"/>
+  <img src="https://img.shields.io/badge/version-v0.9.0-teal" alt="Version v0.9.0"/>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
 </p>
