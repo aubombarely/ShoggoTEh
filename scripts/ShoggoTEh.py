@@ -65,7 +65,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.9.1"
+VERSION = "v0.9.2"
 
 import argparse
 import getpass
@@ -89,7 +89,6 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
 
 try:
     from codecarbon import EmissionsTracker
@@ -284,6 +283,48 @@ def reverse_complement_encoded(X: np.ndarray, y: np.ndarray) -> tuple:
     doesn't change (a SINE is still a SINE reverse-complemented) -- only its
     position order, so y is reversed but not remapped."""
     return _RC_COMPLEMENT_MAP[X][:, ::-1], y[:, ::-1]
+
+
+def compute_strat_key(y: np.ndarray, n_classes: int) -> np.ndarray:
+    """Per-chunk dominant-label stratification key for train_test_split,
+    vectorized. Replaces a pure-Python `Counter(row).most_common(1)` loop
+    that measured ~10 minutes on a real 870k-chunk x 5000bp corpus (Python-
+    level iteration over billions of elements). Same per-class-count-then-
+    argmax technique _select_balanced_chunks already uses for
+    chunk_class_counts -- a handful of vectorized whole-array passes
+    (one per class) instead of one Python object per chunk.
+
+    Tie-breaking differs from Counter.most_common() (which preserves
+    first-occurrence order) -- argmax breaks ties toward the lowest label
+    index instead. Confirmed immaterial: real per-base label distributions
+    are heavily skewed (e.g. LTR ~60% vs SINE ~0.03% on Zea_mays), so an
+    exact tie between a chunk's top two classes essentially never happens;
+    the mismatch only shows up on adversarial uniform-random synthetic
+    data used to test this function, not real chunks. This is only ever
+    used as a train_test_split stratification proxy, not for anything
+    that affects what the model is trained on."""
+    counts = np.zeros((y.shape[0], n_classes), dtype=np.int64)
+    for c in range(n_classes):
+        counts[:, c] = (y == c).sum(axis=1)
+    return counts.argmax(axis=1)
+
+
+def compute_balanced_class_weights(y_flat: np.ndarray, n_classes: int) -> np.ndarray:
+    """sklearn's compute_class_weight(class_weight='balanced') formula
+    (n_samples / (n_present_classes * count[c]), absent classes left at
+    1.0), computed directly via np.bincount instead. Measured ~20 minutes
+    via sklearn on a real ~7-billion-element flattened label array (RC
+    augmentation doubles this vs. before) -- np.bincount is a single
+    optimized C pass over contiguous small-integer data, orders of
+    magnitude faster than sklearn's generic implementation at this
+    scale. Verified to match sklearn's output exactly before replacing it."""
+    counts = np.bincount(y_flat, minlength=n_classes).astype(np.float64)
+    present = counts > 0
+    n_present = int(present.sum())
+    n_samples = y_flat.shape[0]
+    weights = np.ones(n_classes, dtype=np.float64)
+    weights[present] = n_samples / (n_present * counts[present])
+    return weights
 
 
 # ── Windowing (shared: prepare_dataset + predict) ──────────────────────────────
@@ -1406,7 +1447,7 @@ def run_train_dense_cnn(args) -> None:
 
     # Stratify the chunk-level split by each chunk's dominant base label
     # (a per-chunk proxy — the classifier itself trains at base resolution).
-    strat_key = [Counter(row).most_common(1)[0][0] for row in y]
+    strat_key = compute_strat_key(y, len(args.labels))
     idx_train, idx_val = train_test_split(
         np.arange(len(X)), test_size=args.val_fraction,
         stratify=strat_key, random_state=args.seed,
@@ -1422,7 +1463,10 @@ def run_train_dense_cnn(args) -> None:
         # fixed parameter budget -- real biological repeats (LTRs, SINEs,
         # LINEs) occur on either strand. Doubles the train set only; val
         # stays unaugmented so reported metrics reflect real single-strand
-        # performance.
+        # performance. This directly doubles every subsequent per-base
+        # pass over y_train (class-weight computation below, and total
+        # batches/epoch in the training loop) -- an expected, real cost
+        # of doubling the training set, not a bug.
         X_train_rc, y_train_rc = reverse_complement_encoded(X_train, y_train)
         X_train = np.concatenate([X_train, X_train_rc], axis=0)
         y_train = np.concatenate([y_train, y_train_rc], axis=0)
@@ -1434,12 +1478,7 @@ def run_train_dense_cnn(args) -> None:
     class_weights = None
     if args.class_weight == "balanced":
         y_train_flat = y_train.reshape(-1)
-        present_classes = np.unique(y_train_flat)
-        w_present = compute_class_weight(class_weight="balanced",
-                                         classes=present_classes, y=y_train_flat)
-        full_weights = np.ones(len(args.labels), dtype=np.float32)
-        for cls_idx, w in zip(present_classes, w_present):
-            full_weights[cls_idx] = w
+        full_weights = compute_balanced_class_weights(y_train_flat, len(args.labels))
         class_weights = torch.tensor(full_weights, dtype=torch.float32).to(device)
         _log("Class weights (balanced, inverse per-base training frequency):")
         for lbl, w in zip(args.labels, full_weights):
@@ -1688,10 +1727,21 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
     epochs_no_improve = 0
     metrics = []
 
+    # Periodic in-epoch progress logging, matching predict_dense_cnn's
+    # v0.8.1 fix: a real training run at a small --batch_size on the
+    # RC-augmented corpus can have ~87k batches in a single epoch, and
+    # train_dense() previously logged nothing until the *whole* epoch
+    # (train + val) finished -- no way to tell "just slow" from "stuck"
+    # for potentially hours at a time.
+    PROGRESS_LOG_INTERVAL_S = 30
+    n_train_batches = len(train_loader)
+
     for epoch in range(1, epochs + 1):
         model.train(); crf.train()
         train_loss, train_total = 0.0, 0
-        for Xb, yb in train_loader:
+        epoch_t_start = time.monotonic()
+        last_progress_log = epoch_t_start
+        for batch_idx, (Xb, yb) in enumerate(train_loader, start=1):
             Xb, yb = Xb.to(device), yb.to(device)
             optimizer.zero_grad()
             emissions = model(Xb)
@@ -1700,6 +1750,17 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
             loss.backward()
             optimizer.step()
             train_loss  += loss.item() * len(yb)
+
+            now = time.monotonic()
+            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_S:
+                elapsed = now - epoch_t_start
+                rate = batch_idx / elapsed if elapsed > 0 else 0.0
+                eta_min = (n_train_batches - batch_idx) / rate / 60 if rate > 0 else float("nan")
+                pct = 100 * batch_idx / n_train_batches
+                _log(f"  epoch {epoch:3d} progress: {batch_idx:,}/{n_train_batches:,} "
+                     f"batches ({pct:.1f}%) | {rate:.2f} batch/s | "
+                     f"elapsed {elapsed/60:.1f} min | ETA {eta_min:.1f} min")
+                last_progress_log = now
             train_total += len(yb)
             # No training-batch accuracy metric: a cheap on-GPU proxy
             # (raw per-position emissions.argmax(), ignoring the CRF's
@@ -1822,7 +1883,7 @@ def run_train_classifier(args) -> None:
 
     # Stratify the chunk-level split by each chunk's dominant bin label
     # (a per-chunk proxy — the classifier itself trains at bin resolution).
-    strat_key = [Counter(row).most_common(1)[0][0] for row in y]
+    strat_key = compute_strat_key(y, len(args.labels))
     idx_train, idx_val = train_test_split(
         np.arange(len(X)), test_size=args.val_fraction,
         stratify=strat_key, random_state=args.seed,
@@ -1836,12 +1897,7 @@ def run_train_classifier(args) -> None:
     class_weights = None
     if args.class_weight == "balanced":
         y_train_flat = y_train.reshape(-1)
-        present_classes = np.unique(y_train_flat)
-        w_present = compute_class_weight(class_weight="balanced",
-                                         classes=present_classes, y=y_train_flat)
-        full_weights = np.ones(len(args.labels), dtype=np.float32)
-        for cls_idx, w in zip(present_classes, w_present):
-            full_weights[cls_idx] = w
+        full_weights = compute_balanced_class_weights(y_train_flat, len(args.labels))
         class_weights = torch.tensor(full_weights, dtype=torch.float32).to(device)
         _log("Class weights (balanced, inverse per-bin training frequency):")
         for lbl, w in zip(args.labels, full_weights):

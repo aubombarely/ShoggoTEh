@@ -5,6 +5,36 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.9.2] — 2026-07-28
+
+### Added
+
+- **Periodic in-epoch progress logging in `train_dense()`** (every 30s,
+  matching `predict_dense_cnn`'s v0.8.1 fix). Raised when a real
+  Zea_mays training run at `--batch_size 16` on the RC-augmented corpus
+  (~87,000 batches in epoch 1 alone) sat completely silent for 7.5+
+  hours — `train_dense()` previously only logged once a *whole* epoch
+  (train + val) finished, giving no way to tell "just slow" from
+  "stuck" for a run that can genuinely take hours per epoch.
+
+### Changed
+
+- **Vectorized two pre-training steps that were pure-Python loops over
+  the whole corpus**, both real, measured bottlenecks on the same run:
+  stratification-key computation (`compute_strat_key()`, replacing
+  `Counter(row).most_common(1)` — measured ~10 min on 870k chunks) and
+  `--class_weight balanced`'s weight computation (`compute_balanced_
+  class_weights()`, replacing `sklearn.compute_class_weight` with direct
+  `np.bincount` — measured ~20 min on the RC-augmented ~7-billion-
+  element flattened label array, since RC augmentation doubles this
+  computation's input size). Both verified to match their original
+  implementations' output before replacing them (`compute_
+  balanced_class_weights` matches `sklearn` exactly; `compute_strat_key`
+  differs from `Counter`-based tie-breaking only on adversarial
+  near-uniform synthetic data, confirmed immaterial for real, heavily
+  skewed per-base label distributions where exact ties don't occur).
+  Applied to both `train_dense_cnn` and the legacy `train_classifier`.
+
 ## [v0.9.1] — 2026-07-27
 
 ### Changed
