@@ -5,6 +5,27 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.9.5] — 2026-07-28
+
+### Added
+
+- **Mixed-precision training for `train_dense_cnn`** (`--disable_amp` to
+  turn off, on by default on CUDA). v0.9.4's cross-entropy switch was
+  validated on a real run: 0.16-0.18 -> 0.57 batch/s (~3.2x), confirming
+  the CRF loop was the right thing to remove -- but the remaining
+  ~28h/epoch is now genuine GPU compute (24 residual blocks' Conv1d
+  work at channels=128 over T=5000), not overhead. A Tesla T4's Tensor
+  Cores only engage in fp16, not the fp32 this ran in by default (~65 vs
+  ~8 TFLOPS), so autocast + gradient scaling (`torch.amp.autocast` /
+  `torch.amp.GradScaler`) is the standard next lever for exactly this
+  GPU/workload mismatch. Applied to the training batch loop (scaled
+  backward + step) and the validation forward pass; Viterbi decode
+  always runs in fp32 regardless of autocast (cheap relative to
+  training, no need to trade precision for speed there). Auto-disables
+  on non-CUDA devices (no `torch.amp` benefit on CPU/MPS). Verified
+  end-to-end on CPU (correctly no-ops, no crash) -- real GPU speedup
+  unmeasured, needs validation on Salvia.
+
 ## [v0.9.4] — 2026-07-28
 
 ### Changed (breaking: `train_dense_cnn`'s training objective)

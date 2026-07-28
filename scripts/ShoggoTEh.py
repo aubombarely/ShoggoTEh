@@ -65,7 +65,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.9.4"
+VERSION = "v0.9.5"
 
 import argparse
 import getpass
@@ -1458,6 +1458,7 @@ def run_train_dense_cnn(args) -> None:
         if args.balanced_corpus:
             _log(f"  target_bins_per_class: {args.target_bins_per_class}")
         _log(f"  rc_augment     : {not args.disable_rc_augment}")
+        _log(f"  amp            : {not args.disable_amp}")
         _log(f"  labels         : {args.labels}")
         _log("  Steps that would run: load raw-sequence chunks -> "
              "[reverse-complement augment train split] -> train "
@@ -1603,7 +1604,7 @@ def run_train_dense_cnn(args) -> None:
 
     metrics = train_dense(torch_mod, nn, model, crf, train_loader, val_loader, device,
                           args.epochs, args.lr, args.patience, outdir, class_weights,
-                          compute_loss)
+                          compute_loss, use_amp=not args.disable_amp)
 
     emissions_kg = _stop_tracker(tracker)
 
@@ -1659,6 +1660,7 @@ def run_train_dense_cnn(args) -> None:
             "balanced_corpus": args.balanced_corpus,
             "target_bins_per_class": args.target_bins_per_class if args.balanced_corpus else None,
             "rc_augment": not args.disable_rc_augment,
+            "amp": not args.disable_amp,
             "seed": args.seed,
         },
         "resource_usage": {
@@ -1798,7 +1800,7 @@ def _select_balanced_chunks(y: np.ndarray, n_classes: int, target_per_class: int
 
 def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
                 epochs: int, lr: float, patience: int, outdir: Path,
-                class_weights, compute_loss) -> list:
+                class_weights, compute_loss, use_amp: bool = False) -> list:
     """compute_loss(emissions, yb, class_weights, crf) -> scalar loss
     tensor. Injected rather than hardcoded so this shared training loop
     (used by both train_dense_cnn and the legacy train_classifier) can
@@ -1808,8 +1810,20 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
     real training bottleneck at T=5000, un-fixable by compilation alone
     since the forward algorithm's alpha_t depends on alpha_{t-1});
     train_classifier keeps the CRF-trained objective unchanged (T~100
-    there, not a real bottleneck)."""
+    there, not a real bottleneck).
+
+    use_amp: mixed-precision training (autocast + gradient scaling).
+    After removing the CRF-loop bottleneck (v0.9.4), the dominant cost
+    is the dilated CNN's own Conv1d compute (24 residual blocks x 2
+    convs, channels=128, over T=5000) -- real FLOPs, not overhead. A
+    Tesla T4's Tensor Cores only engage in fp16, not the fp32 this ran
+    in by default (~65 vs ~8 TFLOPS), so this is the standard,
+    well-established next lever for exactly this kind of GPU/workload
+    mismatch. Only takes effect when device.type == 'cuda' -- no
+    meaningful benefit on CPU/MPS."""
     optimizer = torch.optim.Adam(list(model.parameters()) + list(crf.parameters()), lr=lr)
+    amp_enabled = use_amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
 
     best_val_loss = float("inf")
     epochs_no_improve = 0
@@ -1832,10 +1846,12 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
         for batch_idx, (Xb, yb) in enumerate(train_loader, start=1):
             Xb, yb = Xb.to(device), yb.to(device)
             optimizer.zero_grad()
-            emissions = model(Xb)
-            loss = compute_loss(emissions, yb, class_weights, crf)
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast(device.type, enabled=amp_enabled):
+                emissions = model(Xb)
+                loss = compute_loss(emissions, yb, class_weights, crf)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             train_loss  += loss.item() * len(yb)
 
             now = time.monotonic()
@@ -1871,11 +1887,16 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
         with torch.no_grad():
             for Xb, yb in val_loader:
                 Xb, yb = Xb.to(device), yb.to(device)
-                emissions = model(Xb)
-                loss = compute_loss(emissions, yb, class_weights, crf)
+                with torch.amp.autocast(device.type, enabled=amp_enabled):
+                    emissions = model(Xb)
+                    loss = compute_loss(emissions, yb, class_weights, crf)
                 val_loss  += loss.item() * len(yb)
                 val_total += len(yb)
-                preds = torch.tensor(crf.decode(emissions), device=device)
+                # Decode in fp32 regardless of autocast -- Viterbi's own
+                # cost is comparatively cheap (once per validation batch,
+                # not once per training batch across many epochs), no
+                # need to trade precision for speed here.
+                preds = torch.tensor(crf.decode(emissions.float()), device=device)
                 val_correct += (preds == yb).sum().item()
                 val_bins    += yb.numel()
 
@@ -3144,6 +3165,14 @@ def _build_parser() -> argparse.ArgumentParser:
                           "repeat motifs regardless of strand orientation, "
                           "since the raw genome sequence it otherwise sees "
                           "is forward-strand only.")
+    opt.add_argument("--disable_amp", action="store_true",
+                     help="Disable mixed-precision training (autocast + "
+                          "gradient scaling), on by default on CUDA. After "
+                          "v0.9.4 removed the CRF-loop training bottleneck, "
+                          "the dominant remaining cost is the dilated CNN's "
+                          "own Conv1d compute -- a Tesla T4's Tensor Cores "
+                          "only engage in fp16, not the fp32 this ran in by "
+                          "default (~65 vs ~8 TFLOPS). No effect on CPU/MPS.")
     opt.add_argument("--seed", type=int, default=42, metavar="N",
                      help="Random seed (default: 42)")
     opt.add_argument("--device", default=None, metavar="DEV",
