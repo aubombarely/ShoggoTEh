@@ -5,6 +5,49 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.9.4] — 2026-07-28
+
+### Changed (breaking: `train_dense_cnn`'s training objective)
+
+- **`train_dense_cnn` now trains via plain per-base cross-entropy, not
+  the CRF's `neg_log_likelihood`.** v0.9.3's fused + TorchScript-compiled
+  CRF loop was validated on a real run and only helped 0.16 -> 0.18
+  batch/s (~12%) -- confirming the bottleneck was never Python/dispatch
+  overhead (which compilation fixes) but the forward algorithm's genuine
+  *sequential dependency* (`alpha_t` depends on `alpha_{t-1}`, so 5,000
+  GPU kernel launches must execute strictly in order, un-fixable by
+  compiling each one better). Discussed with the user directly (two
+  options: keep the exact CRF objective via a from-scratch parallel-scan
+  reformulation, higher effort/risk and unvalidatable without a GPU here;
+  or switch to cross-entropy, fully vectorized, zero sequential loop) --
+  went with cross-entropy.
+  - The CRF module and `decode()` (Viterbi) are unchanged and still used
+    at **inference** time (`predict_dense_cnn` only ever called
+    `decode()`, never `neg_log_likelihood` -- unaffected). Decode's own
+    per-window Viterbi loop is comparatively cheap (once per prediction
+    window, not once per training batch across many epochs).
+  - Since nothing trains `crf.transitions`/`start_transitions`/
+    `end_transitions` via gradient descent anymore, they're instead set
+    once from **empirical consecutive-label statistics** in the
+    (RC-augmented) training corpus (`compute_empirical_transitions()`,
+    Laplace-smoothed, single vectorized pass, no training-time cost) and
+    frozen (`requires_grad_(False)`) -- still gives Viterbi decode a
+    real, data-driven transition-smoothing prior, just not a gradient-
+    learned one. Verified: forward pass, frozen-transitions-stay-frozen
+    after `optimizer.step()`, and model-parameters-do-update, all checked
+    directly; `--class_weight balanced` now uses `F.cross_entropy`'s
+    native per-class `weight` natively (more correct than the previous
+    per-sequence-mean-weight approximation the CRF path needed).
+  - `train_dense()` (the shared training loop) takes a new `compute_loss`
+    callable instead of hardcoding the CRF loss, so the legacy
+    `train_classifier` path (bin resolution, T~100, never a real
+    bottleneck) keeps its original CRF-trained objective unchanged.
+  - **Scientific impact unknown until re-measured**: this changes what
+    the model optimizes for during training. Needs a full retrain +
+    `compare_te_annotation` run to see whether SINE recall/overall
+    accuracy hold up, improve, or regress relative to the CRF-trained
+    v0.9.0-v0.9.3 baseline (overall_accuracy=0.3756, SINE recall=0.393).
+
 ## [v0.9.3] — 2026-07-28
 
 ### Changed

@@ -65,7 +65,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.9.3"
+VERSION = "v0.9.4"
 
 import argparse
 import getpass
@@ -325,6 +325,34 @@ def compute_balanced_class_weights(y_flat: np.ndarray, n_classes: int) -> np.nda
     weights = np.ones(n_classes, dtype=np.float64)
     weights[present] = n_samples / (n_present * counts[present])
     return weights
+
+
+def compute_empirical_transitions(y: np.ndarray, n_classes: int) -> tuple:
+    """Empirical Markov start/transition/end log-probabilities from real
+    consecutive-label statistics in y (n_chunks, seq_len) -- a fast,
+    single-pass, fully vectorized replacement for gradient-learning the
+    CRF's transition parameters via its own neg_log_likelihood, which
+    requires backprop through an O(T) sequential forward-algorithm loop
+    (the real training bottleneck measured at T=5000, see CHANGELOG
+    v0.9.3/v0.9.4). Used as a fixed (frozen, non-trainable) prior for
+    Viterbi decode at inference time, while the CNN itself trains via
+    plain per-base cross-entropy -- a standard emission-model/transition-
+    prior split, and arguably more principled than gradient-learned
+    transitions squeezed through a per-sequence-mean-weighted NLL
+    approximation (the previous --class_weight balanced workaround).
+    Laplace (+1) smoothed so no observed-zero transition is log(0)=-inf."""
+    trans_idx = (y[:, :-1].astype(np.int64) * n_classes
+                + y[:, 1:].astype(np.int64)).ravel()
+    trans_counts = np.bincount(trans_idx, minlength=n_classes * n_classes) \
+        .reshape(n_classes, n_classes).astype(np.float64)
+    start_counts = np.bincount(y[:, 0].astype(np.int64), minlength=n_classes).astype(np.float64)
+    end_counts = np.bincount(y[:, -1].astype(np.int64), minlength=n_classes).astype(np.float64)
+
+    trans_logprob = np.log((trans_counts + 1) / (trans_counts + 1).sum(axis=1, keepdims=True))
+    start_logprob = np.log((start_counts + 1) / (start_counts + 1).sum())
+    end_logprob = np.log((end_counts + 1) / (end_counts + 1).sum())
+    return (start_logprob.astype(np.float32), trans_logprob.astype(np.float32),
+           end_logprob.astype(np.float32))
 
 
 # ── Windowing (shared: prepare_dataset + predict) ──────────────────────────────
@@ -1527,6 +1555,32 @@ def run_train_dense_cnn(args) -> None:
          f"k={args.kernel_size}) -> Linear({args.channels}, {len(args.labels)}) "
          f"-> LinearChainCRF  ({n_params:,} params)")
 
+    # CNN trains via plain cross-entropy (see train_dense's compute_loss
+    # docstring for why: the CRF's own neg_log_likelihood needs backprop
+    # through an O(T) sequential loop, the measured real bottleneck at
+    # T=5000). The CRF's transitions/start/end are instead set directly
+    # from real consecutive-label statistics in the (RC-augmented)
+    # training corpus and frozen -- still gives Viterbi decode a real,
+    # data-driven smoothing prior at inference time, just without any
+    # training-time sequential cost.
+    start_lp, trans_lp, end_lp = compute_empirical_transitions(y_train, len(args.labels))
+    with torch_mod.no_grad():
+        crf.start_transitions.copy_(torch_mod.from_numpy(start_lp))
+        crf.transitions.copy_(torch_mod.from_numpy(trans_lp))
+        crf.end_transitions.copy_(torch_mod.from_numpy(end_lp))
+    crf.start_transitions.requires_grad_(False)
+    crf.transitions.requires_grad_(False)
+    crf.end_transitions.requires_grad_(False)
+    _log("CRF transitions set from empirical training-corpus statistics "
+         "(frozen, not gradient-trained)")
+
+    import torch.nn.functional as F
+
+    def compute_loss(emissions, yb, cw, _crf):
+        n_classes_local = emissions.shape[-1]
+        return F.cross_entropy(emissions.reshape(-1, n_classes_local), yb.reshape(-1),
+                               weight=cw)
+
     label_encoder = {"label_to_idx": {lbl: i for i, lbl in enumerate(args.labels)},
                      "idx_to_label": {str(i): lbl for i, lbl in enumerate(args.labels)}}
     with open(outdir / "label_encoder.json", "w") as fh:
@@ -1537,6 +1591,8 @@ def run_train_dense_cnn(args) -> None:
         "channels": args.channels, "kernel_size": args.kernel_size,
         "n_cycles": args.n_cycles, "embed_dim": args.embed_dim,
         "dropout": args.dropout, "seq_len_trained_on": seq_len,
+        "loss_fn": "cross_entropy",
+        "crf_transitions": "empirical_frozen",
     }
     with open(outdir / "model_config.json", "w") as fh:
         json.dump(model_config, fh, indent=2)
@@ -1546,7 +1602,8 @@ def run_train_dense_cnn(args) -> None:
     tracker = _start_tracker("ShoggoTEh_train_dense_cnn", logs_dir, args.disable_co2_tracking)
 
     metrics = train_dense(torch_mod, nn, model, crf, train_loader, val_loader, device,
-                          args.epochs, args.lr, args.patience, outdir, class_weights)
+                          args.epochs, args.lr, args.patience, outdir, class_weights,
+                          compute_loss)
 
     emissions_kg = _stop_tracker(tracker)
 
@@ -1741,7 +1798,17 @@ def _select_balanced_chunks(y: np.ndarray, n_classes: int, target_per_class: int
 
 def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
                 epochs: int, lr: float, patience: int, outdir: Path,
-                class_weights) -> list:
+                class_weights, compute_loss) -> list:
+    """compute_loss(emissions, yb, class_weights, crf) -> scalar loss
+    tensor. Injected rather than hardcoded so this shared training loop
+    (used by both train_dense_cnn and the legacy train_classifier) can
+    use different objectives: train_dense_cnn uses plain cross-entropy
+    (see run_train_dense_cnn -- the CRF's own neg_log_likelihood requires
+    backprop through an O(T) sequential loop that was measured as the
+    real training bottleneck at T=5000, un-fixable by compilation alone
+    since the forward algorithm's alpha_t depends on alpha_{t-1});
+    train_classifier keeps the CRF-trained objective unchanged (T~100
+    there, not a real bottleneck)."""
     optimizer = torch.optim.Adam(list(model.parameters()) + list(crf.parameters()), lr=lr)
 
     best_val_loss = float("inf")
@@ -1766,8 +1833,7 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
             Xb, yb = Xb.to(device), yb.to(device)
             optimizer.zero_grad()
             emissions = model(Xb)
-            sw = class_weights[yb].mean(dim=1) if class_weights is not None else None
-            loss = crf.neg_log_likelihood(emissions, yb, sw)
+            loss = compute_loss(emissions, yb, class_weights, crf)
             loss.backward()
             optimizer.step()
             train_loss  += loss.item() * len(yb)
@@ -1806,8 +1872,7 @@ def train_dense(torch, nn, model, crf, train_loader, val_loader, device,
             for Xb, yb in val_loader:
                 Xb, yb = Xb.to(device), yb.to(device)
                 emissions = model(Xb)
-                sw = class_weights[yb].mean(dim=1) if class_weights is not None else None
-                loss = crf.neg_log_likelihood(emissions, yb, sw)
+                loss = compute_loss(emissions, yb, class_weights, crf)
                 val_loss  += loss.item() * len(yb)
                 val_total += len(yb)
                 preds = torch.tensor(crf.decode(emissions), device=device)
@@ -1968,8 +2033,15 @@ def run_train_classifier(args) -> None:
     t_start = time.monotonic()
     tracker = _start_tracker("ShoggoTEh_train_classifier", logs_dir, args.disable_co2_tracking)
 
+    def compute_loss(emissions, yb, cw, crf_):
+        # Unchanged CRF-trained objective: T~100 here (bin resolution),
+        # not the O(T=5000) bottleneck train_dense_cnn hit.
+        sw = cw[yb].mean(dim=1) if cw is not None else None
+        return crf_.neg_log_likelihood(emissions, yb, sw)
+
     metrics = train_dense(torch_mod, nn, model, crf, train_loader, val_loader, device,
-                          args.epochs, args.lr, args.patience, outdir, class_weights)
+                          args.epochs, args.lr, args.patience, outdir, class_weights,
+                          compute_loss)
 
     emissions_kg = _stop_tracker(tracker)
 
