@@ -65,7 +65,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.9.2"
+VERSION = "v0.9.3"
 
 import argparse
 import getpass
@@ -1133,6 +1133,37 @@ def _build_dense_model_classes():
     import torch
     import torch.nn as nn
 
+    def _crf_forward_and_score(emissions, tags, start_transitions, transitions,
+                               end_transitions):
+        """Standalone (non-method) version of the fused forward-algorithm
+        + gold-score loop, so it can be torch.jit.script'd directly --
+        real Zea_mays training (T=5000, the v2 architecture's 1bp
+        resolution) measured this loop as the dominant per-batch cost,
+        essentially independent of --batch_size since each iteration
+        processes the whole batch as one op. TorchScript compiles the
+        `for` loop as a real loop (not an unroll, unlike torch.compile,
+        which was tried and hit a RecursionError trying to unroll this
+        exact loop at T=1000) -- cuts Python/dispatch overhead per
+        iteration. Benchmarked ~1.25x on CPU at T=1000; the real win on
+        the GPU this actually needs to run fast on is unmeasured and
+        needs validation before trusting it for a full run."""
+        B, T, _C = emissions.shape
+        idx = torch.arange(B, device=emissions.device)
+        alpha = start_transitions.unsqueeze(0) + emissions[:, 0]
+        gold = start_transitions[tags[:, 0]] + emissions[idx, 0, tags[:, 0]]
+        for t in range(1, T):
+            broadcast = (alpha.unsqueeze(2) + transitions.unsqueeze(0)
+                        + emissions[:, t].unsqueeze(1))
+            alpha = torch.logsumexp(broadcast, dim=1)
+            gold = (gold + transitions[tags[:, t - 1], tags[:, t]]
+                    + emissions[idx, t, tags[:, t]])
+        alpha = alpha + end_transitions.unsqueeze(0)
+        logZ = torch.logsumexp(alpha, dim=1)
+        gold = gold + end_transitions[tags[:, -1]]
+        return logZ, gold
+
+    _crf_forward_and_score_scripted = torch.jit.script(_crf_forward_and_score)
+
     class DenseTEClassifier(nn.Module):
         """Light 1D-CNN local-context smoothing + linear per-bin head on
         top of frozen per-bin Hyena-DNA embeddings."""
@@ -1167,33 +1198,23 @@ def _build_dense_model_classes():
             self.start_transitions = nn.Parameter(torch.randn(n_classes) * 0.01)
             self.end_transitions   = nn.Parameter(torch.randn(n_classes) * 0.01)
 
-        def _score(self, emissions, tags):
-            B, T, _ = emissions.shape
-            idx = torch.arange(B, device=emissions.device)
-            score = self.start_transitions[tags[:, 0]] + emissions[idx, 0, tags[:, 0]]
-            for t in range(1, T):
-                score = (score + self.transitions[tags[:, t - 1], tags[:, t]]
-                         + emissions[idx, t, tags[:, t]])
-            score = score + self.end_transitions[tags[:, -1]]
-            return score
-
-        def _forward_alg(self, emissions):
-            B, T, _ = emissions.shape
-            alpha = self.start_transitions.unsqueeze(0) + emissions[:, 0]
-            for t in range(1, T):
-                broadcast = (alpha.unsqueeze(2) + self.transitions.unsqueeze(0)
-                            + emissions[:, t].unsqueeze(1))
-                alpha = torch.logsumexp(broadcast, dim=1)
-            alpha = alpha + self.end_transitions.unsqueeze(0)
-            return torch.logsumexp(alpha, dim=1)
+        def _forward_alg_and_score(self, emissions, tags):
+            """Fused forward-algorithm partition function (logZ) + gold-
+            tag path score, delegating to the module-level, TorchScript-
+            compiled _crf_forward_and_score_scripted (see its docstring
+            for why: this loop was measured as training's dominant
+            per-batch cost, ~6s/batch, essentially independent of
+            --batch_size)."""
+            return _crf_forward_and_score_scripted(
+                emissions, tags, self.start_transitions, self.transitions,
+                self.end_transitions)
 
         def neg_log_likelihood(self, emissions, tags, sample_weights=None):
             """sample_weights (optional, shape (B,)): per-sequence NLL
             reweighting used to port --class_weight balanced from
             per-window to per-bin frequency (mean weight of the gold bin
             tags in that sequence)."""
-            gold = self._score(emissions, tags)
-            logZ = self._forward_alg(emissions)
+            logZ, gold = self._forward_alg_and_score(emissions, tags)
             nll = logZ - gold
             if sample_weights is not None:
                 nll = nll * sample_weights

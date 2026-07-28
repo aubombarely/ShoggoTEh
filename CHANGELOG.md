@@ -5,6 +5,44 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.9.3] — 2026-07-28
+
+### Changed
+
+- **`LinearChainCRF`'s forward-algorithm loop found to be the real
+  training bottleneck, not batch size.** The v0.9.2 progress logging
+  immediately paid off: a real run at `--batch_size 24` on Salvia showed
+  a rock-steady 0.16 batch/s (ETA ~6,067 min/epoch) regardless of batch
+  size, which pointed at a per-batch, not per-sample, cost. Root cause:
+  `_score`/`_forward_alg` each ran a Python `for t in range(1, T)` loop
+  with `T=5000` (the v2 architecture's 1bp resolution -- 50x more
+  iterations than the old bin_size=50 path's T~100), on *every* training
+  batch, and that cost is roughly independent of `--batch_size` since
+  each iteration processes the whole batch as one op.
+  - **Fused `_score` + `_forward_alg`** into one `_forward_alg_and_score`
+    loop (half the Python-loop iterations for the same math) --
+    verified bit-exact against the original two-loop version (forward
+    values, gradients w.r.t. both `emissions` and `transitions`, all
+    `torch.allclose` to 1e-6).
+  - **TorchScript-compiled the fused loop** (`torch.jit.script`) as a
+    standalone module-level function, since `torch.compile()` was tried
+    first and failed outright -- it tries to unroll the whole loop into
+    a static graph and hit a Python `RecursionError` at `T=1000` on this
+    exact loop (would be worse at the real `T=5000`). `jit.script`
+    compiles the `for` loop as a real loop, not an unroll.
+  - **Honesty about what's verified**: correctness (forward + gradients)
+    is verified; a CPU-only isolated benchmark showed a modest ~1.25x
+    speedup at `T=1000`, well short of what real training needs. GPU
+    kernel-launch overhead (the actual thing being reduced) is typically
+    more expensive than CPU dispatch overhead, so the real speedup on
+    Salvia's T4 is unmeasured and needs validation before trusting it
+    for a full run -- there was no GPU available to test this change
+    directly. If this isn't enough on its own, the next lever is
+    reconsidering whether the CRF's sequence-level training objective is
+    worth its O(T) sequential cost at 1bp resolution versus a plain
+    per-base cross-entropy loss (fully vectorized, no loop) -- discussed
+    with the user but not implemented, pending real numbers from this fix.
+
 ## [v0.9.2] — 2026-07-28
 
 ### Added
