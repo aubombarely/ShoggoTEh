@@ -65,16 +65,21 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.9.5"
+VERSION = "v0.10.0"
 
 import argparse
 import getpass
 import json
 import os
 import platform
+import re
 import resource
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -226,6 +231,251 @@ def _write_summary(outdir: Path, summary: dict) -> Path:
         fh.write("\n")
     _log(f"Run summary written to {summary_path}")
     return summary_path
+
+
+# ── Taxonomy manifest (build_taxonomy_manifest) ─────────────────────────────
+#
+# Built to support multi-genome balanced-corpus construction across a real
+# 177-genome, EarlGrey-annotated collection: reverse-engineers a real
+# binomial species name from this dataset's camelCase file-naming
+# convention (e.g. zeaMays -> Zea mays), looks it up in NCBI Taxonomy, and
+# classifies it into a broad plant taxonomic group (Monocot, Eudicot,
+# Gymnosperm, Bryophyte, ...) via real NCBI lineage clade names -- so later
+# training runs can slice the same prepared corpus into different
+# conditions (all-plants, monocots-only, held-out-taxon, ...) without
+# re-running prepare_dataset for each one.
+
+NCBI_EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+# (NCBI lineage clade/class name, taxonomic group label). Checked as pure
+# membership against the full lineage returned by efetch, not by rank --
+# NCBI's own rank assignment for these clades is inconsistent across
+# records (e.g. Liliopsida appears as rank "clade" for some species, "class"
+# for others), so matching by name only is the reliable approach. Verified
+# directly against real NCBI Taxonomy records for Zea mays (Liliopsida) and
+# Arabidopsis thaliana (eudicotyledons) before the rest of this list was
+# filled in from standard NCBI nomenclature -- anything not matched here
+# reports "Unclassified" rather than a guess, and should be checked by hand.
+TAXONOMIC_GROUP_MARKERS = [
+    ("Liliopsida",       "Monocot"),
+    ("eudicotyledons",   "Eudicot"),
+    ("magnoliids",       "Magnoliid"),
+    ("Nymphaeales",      "Basal_angiosperm"),
+    ("Amborellales",     "Basal_angiosperm"),
+    ("Acrogymnospermae", "Gymnosperm"),
+    ("Pinopsida",        "Gymnosperm"),
+    ("Gnetopsida",       "Gymnosperm"),
+    ("Cycadopsida",      "Gymnosperm"),
+    ("Ginkgoopsida",     "Gymnosperm"),
+    ("Polypodiopsida",   "Fern"),
+    ("Lycopodiopsida",   "Lycophyte"),
+    ("Bryophyta",        "Bryophyte_moss"),
+    ("Marchantiophyta",  "Bryophyte_liverwort"),
+    ("Anthocerotophyta", "Bryophyte_hornwort"),
+    ("Chlorophyta",      "Green_algae"),
+    ("Charophyta",       "Charophyte_algae"),
+]
+
+
+def camel_to_binomial(name: str) -> str:
+    """zeaMays -> Zea mays. Splits on camelCase word boundaries and
+    reassembles as a binomial (genus capitalized, remaining words
+    lowercase) -- handles subspecies/cultivar suffixes too (e.g.
+    oryzaSativaJaponica -> Oryza sativa japonica). Not infallible against
+    unusual naming conventions, which is exactly why every lookup result
+    keeps the derived binomial_name alongside its NCBI status for manual
+    review."""
+    parts = re.findall(r"[A-Z][a-z]*|^[a-z]+", name)
+    if not parts:
+        return name
+    parts = [p.lower() for p in parts]
+    return parts[0].capitalize() + " " + " ".join(parts[1:])
+
+
+def classify_taxonomic_group(lineage_names: list) -> str:
+    lineage_set = set(lineage_names)
+    for marker, group in TAXONOMIC_GROUP_MARKERS:
+        if marker in lineage_set:
+            return group
+    return "Unclassified"
+
+
+def _ssl_context():
+    """Python's ssl module doesn't automatically use the OS trust store the
+    way curl does -- on some machines (confirmed on the one this was
+    developed on) that means urlopen() fails with CERTIFICATE_VERIFY_FAILED
+    against a perfectly valid public endpoint. Using certifi's CA bundle
+    explicitly fixes it without weakening verification (no unverified-
+    context fallback); falls back to Python's own default context if
+    certifi isn't installed."""
+    try:
+        import certifi
+        import ssl
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return None
+
+
+def _ncbi_request(url: str, max_retries: int = 3) -> bytes:
+    ctx = _ssl_context()
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=15, context=ctx) as resp:
+                return resp.read()
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == max_retries:
+                raise
+            time.sleep(2 * attempt)
+
+
+def query_ncbi_taxonomy(binomial_name: str, email: str, api_key: str = None) -> dict:
+    """Looks up one species' NCBI Taxonomy record by binomial name (esearch
+    then efetch). Returns status="ok"/"ambiguous"/"not_found"/"error" --
+    "ambiguous" means esearch returned >1 hit (rare for a well-formed
+    binomial, but possible for hybrids/synonyms); the first hit is still
+    used but flagged, never silently trusted as unique."""
+    esearch_params = {"db": "taxonomy", "term": binomial_name, "retmode": "json",
+                      "email": email}
+    if api_key:
+        esearch_params["api_key"] = api_key
+    esearch_url = f"{NCBI_EUTILS_BASE}/esearch.fcgi?{urllib.parse.urlencode(esearch_params)}"
+    try:
+        idlist = json.loads(_ncbi_request(esearch_url))["esearchresult"].get("idlist", [])
+    except Exception as exc:
+        return {"status": "error", "taxid": None, "order": None, "family": None,
+               "taxonomic_group": None, "lineage": None, "error": str(exc)}
+
+    if not idlist:
+        return {"status": "not_found", "taxid": None, "order": None, "family": None,
+               "taxonomic_group": None, "lineage": None, "error": None}
+
+    status = "ok" if len(idlist) == 1 else "ambiguous"
+    taxid = idlist[0]
+
+    efetch_params = {"db": "taxonomy", "id": taxid, "rettype": "xml", "email": email}
+    if api_key:
+        efetch_params["api_key"] = api_key
+    efetch_url = f"{NCBI_EUTILS_BASE}/efetch.fcgi?{urllib.parse.urlencode(efetch_params)}"
+    try:
+        root = ET.fromstring(_ncbi_request(efetch_url))
+        lineage_ex = root.find("Taxon").find("LineageEx")
+        rank_to_name = {lt.findtext("Rank"): lt.findtext("ScientificName") for lt in lineage_ex}
+        lineage_names = [lt.findtext("ScientificName") for lt in lineage_ex]
+        return {
+            "status": status, "taxid": taxid,
+            "order": rank_to_name.get("order"),
+            "family": rank_to_name.get("family"),
+            "taxonomic_group": classify_taxonomic_group(lineage_names),
+            "lineage": "; ".join(lineage_names),
+            "error": None,
+        }
+    except Exception as exc:
+        return {"status": "error", "taxid": taxid, "order": None, "family": None,
+               "taxonomic_group": None, "lineage": None, "error": str(exc)}
+
+
+def run_build_taxonomy_manifest(args) -> None:
+    args.species_tsv = args.species_tsv.resolve()
+    outdir = args.outdir.resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    logs_dir = outdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _open_log(logs_dir, "build_taxonomy_manifest")
+
+    _validate_inputs([("--species_tsv", args.species_tsv)])
+
+    if args.dry_run:
+        _banner("Dry run — no steps will be executed")
+        _log(f"  species_tsv : {args.species_tsv}")
+        _log(f"  outdir      : {outdir}/")
+        _log(f"  email       : {args.email}")
+        _log(f"  api_key set : {bool(args.ncbi_api_key)}")
+        _log("  Steps that would run: parse species_tsv -> camelCase-to-binomial "
+             "-> NCBI Taxonomy lookup per species -> classify taxonomic group")
+        _log("  Exiting (--dry_run).")
+        sys.exit(0)
+
+    species_df = pd.read_csv(
+        args.species_tsv, sep="\t", comment="#", header=None,
+        names=["species_id", "fasta", "bed", "gff3"],
+    )
+    species_ids = species_df["species_id"].astype(str).tolist()
+    _log(f"{len(species_ids):,} species in {args.species_tsv}")
+
+    manifest_path = outdir / "taxonomy_manifest.tsv"
+    existing = {}
+    if manifest_path.exists() and not args.force:
+        prev = pd.read_csv(manifest_path, sep="\t")
+        for _, row in prev.iterrows():
+            if row["status"] in ("ok", "ambiguous"):
+                existing[row["species_id"]] = row.to_dict()
+        _log(f"  [checkpoint] {len(existing):,} species already resolved in "
+             f"{manifest_path.name}, skipping (use --force to re-query all; "
+             f"species that previously failed are retried automatically)")
+
+    rate_delay = 1.0 / (10 if args.ncbi_api_key else 3)  # NCBI usage policy
+    rows = []
+    n_ok = n_ambiguous = n_not_found = n_error = 0
+    t_start = time.monotonic()
+
+    for i, species_id in enumerate(species_ids, start=1):
+        if species_id in existing:
+            rows.append(existing[species_id])
+            continue
+        binomial = camel_to_binomial(species_id)
+        result = query_ncbi_taxonomy(binomial, args.email, args.ncbi_api_key)
+        rows.append({"species_id": species_id, "binomial_name": binomial, **result})
+        status = result["status"]
+        if status == "ok":
+            n_ok += 1
+        elif status == "ambiguous":
+            n_ambiguous += 1
+        elif status == "not_found":
+            n_not_found += 1
+        else:
+            n_error += 1
+        _log(f"  [{i}/{len(species_ids)}] {species_id} -> {binomial} "
+             f"-> {result['taxonomic_group']} ({status})")
+        time.sleep(rate_delay)
+
+    df = pd.DataFrame(rows).sort_values("species_id").reset_index(drop=True)
+    df.to_csv(manifest_path, sep="\t", index=False)
+    _log(f"Manifest written to {manifest_path}")
+
+    _log(f"Resolved: {n_ok:,} ok | {n_ambiguous:,} ambiguous | "
+         f"{n_not_found:,} not found | {n_error:,} errors")
+    if n_ambiguous or n_not_found or n_error:
+        _log(f"  {n_ambiguous + n_not_found + n_error:,} species need manual "
+             f"review -- see the status column in {manifest_path.name}")
+
+    group_counts = (df[df["status"].isin(["ok", "ambiguous"])]["taxonomic_group"]
+                    .value_counts())
+    _log("Taxonomic group breakdown:")
+    for group, count in group_counts.items():
+        _log(f"    {group:20s} {count:>4,}")
+
+    elapsed_s   = time.monotonic() - t_start
+    peak_mem_mb = _peak_mem_mb()
+    _log(f"Wall-clock time   : {elapsed_s:.1f} s ({elapsed_s/60:.1f} min)")
+    _log(f"Peak memory (RSS) : {peak_mem_mb:.1f} MB")
+
+    summary = {
+        "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": VERSION,
+        "input_species_tsv": str(args.species_tsv),
+        "n_species":      len(species_ids),
+        "n_resolved_ok":  int(n_ok),
+        "n_ambiguous":    int(n_ambiguous),
+        "n_not_found":    int(n_not_found),
+        "n_error":        int(n_error),
+        "taxonomic_group_counts": group_counts.to_dict(),
+        "resource_usage": {
+            "wall_clock_s": round(elapsed_s, 1),
+            "peak_mem_mb":  round(peak_mem_mb, 1),
+        },
+    }
+    _write_summary(outdir, summary)
+    _close_log()
 
 
 # ── Repeat class mapping (shared across prepare_dataset / compare_te_annotation) ──
@@ -3011,6 +3261,38 @@ def _build_parser() -> argparse.ArgumentParser:
     opt.add_argument("--disable_co2_tracking", action="store_true",
                      help="Disable carbon footprint tracking")
 
+    # ── build_taxonomy_manifest ─────────────────────────────────────────────
+    btm = sub.add_parser("build_taxonomy_manifest",
+                         help="Derive a real binomial species name and NCBI "
+                              "taxonomic group (Monocot/Eudicot/Gymnosperm/"
+                              "Bryophyte/...) for every species in a "
+                              "prepare_dataset-style species_tsv, for "
+                              "multi-genome balanced-corpus construction")
+    req = btm.add_argument_group("required")
+    req.add_argument("--species_tsv", required=True, type=Path, metavar="FILE",
+                     help="Same TSV format as prepare_dataset (species_id, "
+                          "fasta, bed, gff3) -- only species_id (camelCase, "
+                          "e.g. zeaMays) is used")
+    req.add_argument("--outdir", required=True, type=Path, metavar="DIR",
+                     help="Output directory for taxonomy_manifest.tsv")
+    req.add_argument("--email", required=True, metavar="EMAIL",
+                     help="Email address sent with every NCBI E-utilities "
+                          "request -- required by NCBI's usage policy for "
+                          "identification, not optional here either (see "
+                          "https://www.ncbi.nlm.nih.gov/books/NBK25497/)")
+    opt = btm.add_argument_group("optional")
+    opt.add_argument("--ncbi_api_key", default=None, metavar="KEY",
+                     help="Optional NCBI API key -- raises the rate limit "
+                          "from 3 to 10 requests/second (get one from your "
+                          "NCBI account settings)")
+    opt.add_argument("--force", action="store_true",
+                     help="Re-query all species even if already resolved in "
+                          "an existing taxonomy_manifest.tsv (species that "
+                          "previously failed are always retried, with or "
+                          "without --force)")
+    opt.add_argument("--dry_run", action="store_true",
+                     help="Validate inputs and print planned steps, then exit")
+
     # ── generate_embeddings ─────────────────────────────────────────────────
     gp = sub.add_parser("generate_embeddings",
                         help="Run chunks through Hyena-DNA and pool into "
@@ -3309,6 +3591,8 @@ def main() -> None:
 
     if args.command == "prepare_dataset":
         run_prepare_dataset(args)
+    elif args.command == "build_taxonomy_manifest":
+        run_build_taxonomy_manifest(args)
     elif args.command == "generate_embeddings":
         run_generate_embeddings(args)
     elif args.command == "train_classifier":

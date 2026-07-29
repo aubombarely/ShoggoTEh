@@ -5,6 +5,43 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.10.0] — 2026-07-29
+
+### Added
+
+- **New `build_taxonomy_manifest` subcommand** — first step toward a
+  multi-genome balanced corpus across the real 177-genome, EarlGrey-
+  annotated collection. Reverse-engineers a real binomial species name
+  from the dataset's camelCase file-naming convention (`camel_to_
+  binomial()`, e.g. `zeaMays` -> `Zea mays`), looks each one up against
+  real NCBI Taxonomy (`query_ncbi_taxonomy()`, esearch + efetch), and
+  classifies it into a broad plant taxonomic group (Monocot, Eudicot,
+  Gymnosperm, Bryophyte, ...) via real NCBI lineage clade names
+  (`classify_taxonomic_group()`) -- membership-based on clade *name*,
+  not NCBI's own rank label, since rank assignment for these clades is
+  inconsistent across records (confirmed directly: `Liliopsida`
+  appears as rank "clade" for some species, "class" for others).
+  Verified against real, live NCBI Taxonomy records for four real
+  species spanning the groups that actually matter here (Zea mays ->
+  Monocot, Oryza sativa -> Monocot, Arabidopsis thaliana -> Eudicot,
+  Physcomitrella patens -> Bryophyte_moss), not synthetic data.
+  Takes the same `species_tsv` format `prepare_dataset` already uses,
+  so the same file drives both. Per-species checkpointed (failed
+  lookups always retried on rerun, successful ones skipped unless
+  `--force`) and rate-limited to NCBI's usage policy (3 req/s, 10 with
+  `--ncbi_api_key`). Output is a separate `taxonomy_manifest.tsv`
+  (species_id, binomial_name, taxid, order, family, taxonomic_group,
+  lineage, status) meant to be joined with the species_tsv by
+  `species_id` -- deliberately doesn't touch `prepare_dataset`'s
+  existing format at all.
+  Along the way, fixed a real `CERTIFICATE_VERIFY_FAILED` error hit on
+  first real run against NCBI's API: Python's `ssl` module doesn't use
+  the OS trust store the way `curl` does on this machine, so
+  `urlopen()` failed against a perfectly valid public endpoint;
+  `_ssl_context()` now explicitly uses `certifi`'s CA bundle (new
+  dependency) rather than falling back to unverified SSL, which would
+  have been a real security regression for no good reason.
+
 ## [v0.9.5] — 2026-07-28
 
 ### Added

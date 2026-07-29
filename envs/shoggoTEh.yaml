@@ -13,6 +13,7 @@ dependencies:
   - bedtools
   - scikit-learn
   - matplotlib
+  - certifi
   - pip
   - pip:
       # Pinned to the known-good version manually installed on Salvia
