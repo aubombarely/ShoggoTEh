@@ -65,7 +65,7 @@ Usage
   python3 scripts/ShoggoTEh.py compare_te_annotation -t ... -r ... --outdir ...
 """
 
-VERSION = "v0.10.0"
+VERSION = "v0.10.1"
 
 import argparse
 import getpass
@@ -260,8 +260,16 @@ TAXONOMIC_GROUP_MARKERS = [
     ("Liliopsida",       "Monocot"),
     ("eudicotyledons",   "Eudicot"),
     ("magnoliids",       "Magnoliid"),
+    # NCBI uses the formal class name "Magnoliidae" for some records instead
+    # of the informal clade name "magnoliids" above -- caught via 7 real
+    # species (Annona, Asimina, Cinnamomum, Litsea, Magnolia, Persea) that
+    # came back "Unclassified" despite a successful NCBI lookup.
+    ("Magnoliidae",      "Magnoliid"),
     ("Nymphaeales",      "Basal_angiosperm"),
     ("Amborellales",     "Basal_angiosperm"),
+    # Third ANITA-grade (earliest-diverging angiosperm) order, missing
+    # alongside the two above -- caught via Schisandra chinensis.
+    ("Austrobaileyales", "Basal_angiosperm"),
     ("Acrogymnospermae", "Gymnosperm"),
     ("Pinopsida",        "Gymnosperm"),
     ("Gnetopsida",       "Gymnosperm"),
@@ -274,6 +282,9 @@ TAXONOMIC_GROUP_MARKERS = [
     ("Anthocerotophyta", "Bryophyte_hornwort"),
     ("Chlorophyta",      "Green_algae"),
     ("Charophyta",       "Charophyte_algae"),
+    # Charophyte-grade algal class not covered by the Charophyta marker --
+    # caught via Zygnema circumcarinatum.
+    ("Zygnematophyceae", "Charophyte_algae"),
 ]
 
 

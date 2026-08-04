@@ -5,6 +5,32 @@ Dates follow ISO 8601 (YYYY-MM-DD). Changes are grouped by version and type.
 
 ---
 
+## [v0.10.1] — 2026-08-04
+
+### Fixed
+
+- **`classify_taxonomic_group` had three real clade-coverage gaps**, found
+  from a real full-scale run of `build_taxonomy_manifest` against the
+  177-genome collection: 9/177 species (all `status=ok`, i.e. real,
+  successful NCBI lookups) fell through to `"Unclassified"` because none
+  of the 17 marker clade names matched their lineage.
+  - 7 species (*Annona* ×2, *Asimina*, *Cinnamomum*, *Litsea*, *Magnolia*,
+    *Persea*) use NCBI's formal class name `Magnoliidae` instead of the
+    informal clade name `magnoliids` the marker list checked for — the
+    same kind of clade-name-vs-rank inconsistency already documented for
+    `Liliopsida` in v0.10.0. Added `("Magnoliidae", "Magnoliid")`.
+  - *Schisandra chinensis* is in `Austrobaileyales`, the third
+    ANITA-grade (earliest-diverging angiosperm) order — only
+    `Nymphaeales` and `Amborellales` were covered. Added
+    `("Austrobaileyales", "Basal_angiosperm")`.
+  - *Zygnema circumcarinatum* is in `Zygnematophyceae`, a charophyte-grade
+    algal class not covered by the `Charophyta` marker. Added
+    `("Zygnematophyceae", "Charophyte_algae")`.
+  All three verified directly against the real lineage strings from the
+  177-genome run (all 9 previously-unclassified species now resolve
+  correctly), plus a regression check confirming `zeaMays`/
+  `arabidopsisThaliana`/`physcomitrellaPatens` still classify unchanged.
+
 ## [v0.10.0] — 2026-07-29
 
 ### Added
